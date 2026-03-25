@@ -19,12 +19,13 @@
 %
 % Functions
 % ---------
-%   proxswap_lattice(network, shuffles)  -- main entry point
+%   proxswap_lattice(network, weighted, shuffles)  -- main entry point
 %   build_pairs(D, distance_seq)
 %   proximity_pass(nodes, ring, budget, pairs, distance_seq)
 %   swapping_pass(nodes, ring, budget, total_budget)
+%   assign_weights(network, A)
 
-function [ring, CC] = proxswap_lattice(network, shuffles)
+function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 % PROXSWAP_LATTICE  Construct a degree-preserving ring lattice via
 %   proximity-swap construction.
 %
@@ -33,17 +34,28 @@ function [ring, CC] = proxswap_lattice(network, shuffles)
 %   matches the original, while maximising the average local clustering
 %   coefficient.  Non-zero off-diagonal entries are treated as edges; the
 %   binary adjacency is derived internally.  Isolated nodes (degree zero)
-%   are supported.  Defaults to 100 shuffle passes.
+%   are supported.  Defaults to binary output and 100 shuffle passes.
 %
-%   [RING, CC] = PROXSWAP_LATTICE(NETWORK, SHUFFLES) also returns the
-%   average clustering coefficient of the returned lattice as CC.
+%   [RING, CC] = PROXSWAP_LATTICE(NETWORK, WEIGHTED, SHUFFLES) also
+%   returns the average clustering coefficient of the returned lattice
+%   as CC.
 %
 %   Arguments
 %   ---------
 %   network  : n x n numeric matrix (weighted or binary, symmetric).
-%              Non-zero off-diagonal entries are treated as edges; the
-%              binary adjacency is derived internally as (network ~= 0).
-%              Isolated nodes (degree zero) are supported.
+%              Absolute values are taken internally, so signed weights are
+%              handled automatically.  Non-zero off-diagonal entries are
+%              treated as edges; the binary adjacency is derived internally
+%              as (network ~= 0).  Isolated nodes (degree zero) are
+%              supported.
+%   weighted : logical scalar, whether to return a weighted lattice
+%              (default false).  When true, edge weights from NETWORK are
+%              reassigned to the lattice topology following Muldoon,
+%              Bridgeford, & Bassett (2016): shorter-distance lattice edges
+%              receive larger weights, preserving the overall weight
+%              distribution.  The clustering coefficient is then computed
+%              via clustering_coef_wu (BCT) rather than clustering_coef_bu.
+%              When false, a binary logical adjacency matrix is returned.
 %   shuffles : positive integer, number of independent random permutation
 %              passes to attempt (default 100).  Only passes producing a
 %              connected graph with zero degree error are retained; the one
@@ -51,10 +63,13 @@ function [ring, CC] = proxswap_lattice(network, shuffles)
 %
 %   Returns
 %   -------
-%   ring : n x n logical symmetric adjacency matrix representing the ring
-%          lattice with the best average clustering coefficient among all
-%          valid passes.  When the empirical adjacency is returned as a
-%          fallback, ring equals the binarised input network.
+%   ring : n x n symmetric matrix representing the ring lattice with the
+%          best average clustering coefficient among all valid passes.
+%          When WEIGHTED is false (default), entries are logical (0/1).
+%          When WEIGHTED is true, entries contain the reassigned edge
+%          weights from NETWORK.  When the empirical fallback is taken,
+%          ring equals the binarised input (WEIGHTED false) or the absolute-
+%          value input matrix (WEIGHTED true).
 %   CC   : scalar double, average clustering coefficient of ring.  Equals
 %          the empirical CC when the empirical-fallback path is taken.
 %
@@ -68,21 +83,34 @@ function [ring, CC] = proxswap_lattice(network, shuffles)
 %   3. Swap repair           -- any residual deficit is resolved by direct
 %      connection or an edge swap, scanning interleaved clockwise /
 %      counter-clockwise positions.
-%   4. Pass selection        -- only connected, zero-deficit passes are
+%   4. Weight assignment     -- when WEIGHTED is true, edge weights are
+%      reassigned after the binary topology is finalised via ASSIGN_WEIGHTS.
+%   5. Pass selection        -- only connected, zero-deficit passes are
 %      kept; the highest-CC pass is returned.
-%   5. Empirical fallback    -- if no valid pass beats the empirical CC,
-%      the original adjacency is returned with a warning.
+%   6. Empirical fallback    -- if no valid pass beats the empirical CC,
+%      the original adjacency (or weighted matrix) is returned with a
+%      warning.
 %
 %   Dependencies
 %   ------------
-%   clustering_coef_bu  (BCT) -- computes per-node clustering coefficients;
-%                                the average is taken over all nodes.
-%   get_components      (BCT) -- connectivity is confirmed when exactly one
+%   clustering_coef_bu  (BCT) -- per-node clustering coefficients for
+%                                binary networks; average taken over nodes.
+%   clustering_coef_wu  (BCT) -- per-node clustering coefficients for
+%                                weighted networks; used when WEIGHTED true.
+%   get_components      (BCT) -- connectivity confirmed when exactly one
 %                                component is returned.
 
-    if nargin < 2
+    if nargin < 2 || isempty(weighted)
+        weighted = false;
+    end
+    if nargin < 3
         shuffles = 100;
     end
+
+    % ------------------------------------------------------------------
+    % Ensure absolute values (handles signed weight matrices)
+    % ------------------------------------------------------------------
+    network = abs(network);
 
     % ------------------------------------------------------------------
     % Derive binary adjacency
@@ -106,10 +134,14 @@ function [ring, CC] = proxswap_lattice(network, shuffles)
     pairs = build_pairs(D, distance_seq);
 
     % ------------------------------------------------------------------
-    % Empirical clustering coefficient (fallback reference)
-    % clustering_coef_bu returns a per-node vector; average across all nodes.
+    % Empirical clustering coefficient (fallback reference).
+    % Use clustering_coef_wu for weighted, clustering_coef_bu for binary.
     % ------------------------------------------------------------------
-    empirical_CC = mean(clustering_coef_bu(double(A)));
+    if weighted
+        empirical_CC = mean(clustering_coef_wu(network));
+    else
+        empirical_CC = mean(clustering_coef_bu(double(A)));
+    end
 
     % ------------------------------------------------------------------
     % Initialise best-pass trackers
@@ -144,14 +176,24 @@ function [ring, CC] = proxswap_lattice(network, shuffles)
             continue
         end
 
-        % Clustering coefficient for this valid pass
-        % clustering_coef_bu returns a per-node vector; average across all nodes.
-        pass_CC = mean(clustering_coef_bu(double(result.ring)));
+        % Assign weights to the valid binary topology when requested
+        pass_ring = result.ring;
+        if weighted
+            pass_ring = assign_weights(network, pass_ring);
+        end
+
+        % Clustering coefficient for this valid pass.
+        % Use clustering_coef_wu for weighted, clustering_coef_bu for binary.
+        if weighted
+            pass_CC = mean(clustering_coef_wu(pass_ring));
+        else
+            pass_CC = mean(clustering_coef_bu(double(pass_ring)));
+        end
 
         % Keep the best
         if pass_CC > best_CC
             best_CC   = pass_CC;
-            best_ring = result.ring;
+            best_ring = pass_ring;
             best_swap = swap_order;
         end
 
@@ -173,7 +215,12 @@ function [ring, CC] = proxswap_lattice(network, shuffles)
     % Restore original node ordering  (invert the permutation)
     % ------------------------------------------------------------------
     if empirical_flag
-        ring = A;
+        % Return weighted matrix or binary adjacency depending on mode
+        if weighted
+            ring = network;
+        else
+            ring = A;
+        end
         CC   = empirical_CC;
     else
         % original_order is the inverse permutation of best_swap:
@@ -481,3 +528,64 @@ function result = swapping_pass(nodes, ring, budget, total_budget)
 
 end % swapping_pass
 
+
+% ==========================================================================
+%  assign_weights
+% ==========================================================================
+function A = assign_weights(network, A)
+% ASSIGN_WEIGHTS  Reassign edge weights from NETWORK onto the binary lattice A.
+%
+%   Translated from assign_weights() in proxswap_lattice.R.
+%
+%   Following Muldoon, Bridgeford, & Bassett (2016): edge weights are mapped
+%   onto the lattice such that shorter-distance lattice edges (quantified by
+%   Euclidean distance between adjacency-row profiles) receive larger weights,
+%   preserving the overall weight distribution of the original network.
+%
+%   Arguments
+%   ---------
+%   network : n x n numeric matrix, the original weighted network (absolute
+%             values assumed already taken by the caller).  Non-zero lower-
+%             triangle entries supply the weight pool.
+%   A       : n x n logical or numeric binary adjacency matrix (the lattice
+%             topology, as returned by swapping_pass).
+%
+%   Returns
+%   -------
+%   A : n x n symmetric double matrix with reassigned edge weights.
+
+    n = size(network, 1);
+
+    % Lower-triangle mask (strict: excludes diagonal)
+    lt_mask = logical(tril(ones(n), -1));
+
+    % Extract non-zero weights from lower triangle of network
+    net_lt  = network(lt_mask);
+    weights = net_lt(net_lt ~= 0);          % weight pool (column vector)
+
+    % Identify non-zero edges in lower triangle of A
+    A_lt      = double(A(lt_mask));
+    A_nz_mask = A_lt ~= 0;                  % logical index into lt values
+
+    % Pairwise Euclidean distances between adjacency-row profiles of A.
+    % squareform(pdist(A)) mirrors R's as.matrix(dist(A)).
+    dist_matrix = squareform(pdist(double(A)));
+    dist_lt     = dist_matrix(lt_mask);
+    edge_dists  = dist_lt(A_nz_mask);       % distances for lattice edges
+
+    % Random-tiebreak rank, mirroring R's rank(..., ties.method = "random"):
+    %   shuffle the distances, sort, then invert to obtain ranks.
+    n_edges = numel(edge_dists);
+    rp      = randperm(n_edges);
+    [~, sort_idx]  = sort(edge_dists(rp));
+    weight_order   = zeros(1, n_edges);
+    weight_order(rp(sort_idx)) = 1:n_edges;
+
+    % Write weights into lower triangle, zero upper triangle, symmetrise
+    result          = zeros(n);
+    lt_vals         = zeros(size(A_lt));
+    lt_vals(A_nz_mask) = weights(weight_order);
+    result(lt_mask) = lt_vals;
+    A               = result + result';     % symmetric weighted matrix
+
+end % assign_weights

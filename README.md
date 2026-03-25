@@ -53,9 +53,9 @@ The algorithm is implemented in four languages. All ports are faithful translati
 
 | File | Language | Dependencies | Notes |
 |------|----------|--------------|-------|
-| `proxswap_lattice.R` | R | [{igraph}](https://igraph.org/r/) · [{L0ggm}](https://github.com/AlexChristensen/L0ggm) internals (`convert2igraph`, `shuffle`, `swiftelse`) | Reference implementation; used in the {L0ggm} R package. |
-| `proxswap_lattice.m` | MATLAB | [Brain Connectivity Toolbox](https://sites.google.com/site/bctnet/) (`clustering_coef_bu`, `get_components`) | Both BCT files must be on the MATLAB path. Ported with Claude Sonnet 4.6. |
-| `proxswap_lattice.py` | Python | [NumPy](https://numpy.org) · [NetworkX](https://networkx.org) | Both required. NetworkX is used for `average_clustering` and `is_connected`, mirroring the igraph calls in the R implementation. Ported with Claude Sonnet 4.6. |
+| `proxswap_lattice.R` | R | [{igraph}](https://igraph.org/r/) · [{L0ggm}](https://github.com/AlexChristensen/L0ggm) internals (`convert2igraph`, `shuffle`, `swiftelse`) | Reference implementation; used in the {L0ggm} R package. Supports `weighted = TRUE` via `assign_weights()`. |
+| `proxswap_lattice.m` | MATLAB | [Brain Connectivity Toolbox](https://sites.google.com/site/bctnet/) (`clustering_coef_bu`, `clustering_coef_wu`, `get_components`) | All three BCT files must be on the MATLAB path. Supports `weighted` argument. Ported with Claude Sonnet 4.6. |
+| `proxswap_lattice.py` | Python | [NumPy](https://numpy.org) · [NetworkX](https://networkx.org) | Both required. NetworkX is used for `average_clustering` and `is_connected`, mirroring the igraph calls in the R implementation. Supports `weighted=True`. Ported with Claude Sonnet 4.6. |
 
 ---
 
@@ -83,10 +83,11 @@ install.packages("igraph")
 
 | BCT function | Role |
 |--------------|------|
-| `clustering_coef_bu` | Computes per-node clustering coefficients; the average is taken across all nodes |
+| `clustering_coef_bu` | Computes per-node clustering coefficients for binary networks; the average is taken across all nodes |
+| `clustering_coef_wu` | Computes per-node clustering coefficients for weighted networks; used when `weighted = true` |
 | `get_components` | Connected-component labelling; a pass is accepted when exactly one component is returned |
 
-Both files must be on the MATLAB path before calling `proxswap_lattice`.
+All three files must be on the MATLAB path before calling `proxswap_lattice`.
 
 ### Python
 
@@ -109,7 +110,7 @@ pip install numpy networkx
 # Install {L0ggm} or source the file directly
 source("proxswap_lattice.R")
 
-# Estimate network and construct lattice
+# Estimate network and construct binary ring lattice
 network <- network_estimation(data)
 L <- proxswap_lattice(network, shuffles = 100)
 
@@ -118,14 +119,23 @@ attr(L, "CC")
 
 # Degree sequences should match exactly
 cbind(target = colSums(network != 0), achieved = colSums(L))
+
+# Construct weighted ring lattice
+L_weighted <- proxswap_lattice(network, weighted = TRUE, shuffles = 100)
+attr(L_weighted, "CC")
 ```
 
 ### MATLAB usage
 
 ```matlab
 % All functions are contained in proxswap_lattice.m
-[L, CC] = proxswap_lattice(network, 100);
+% Binary lattice (default)
+[L, CC] = proxswap_lattice(network, false, 100);
 fprintf('Average CC: %.4f\n', CC);
+
+% Weighted lattice
+[L_w, CC_w] = proxswap_lattice(network, true, 100);
+fprintf('Weighted average CC: %.4f\n', CC_w);
 ```
 
 ### Python usage
@@ -134,10 +144,15 @@ fprintf('Average CC: %.4f\n', CC);
 import numpy as np
 from proxswap_lattice import proxswap_lattice
 
+# Binary lattice (default)
 ring, cc = proxswap_lattice(network, shuffles=100)
 print("Average clustering coefficient:", cc)
 print("Degree sequences match:",
       np.array_equal(network.astype(bool).sum(axis=0), ring.sum(axis=0)))
+
+# Weighted lattice
+ring_w, cc_w = proxswap_lattice(network, weighted=True, shuffles=100)
+print("Weighted average clustering coefficient:", cc_w)
 ```
 
 ---

@@ -1,124 +1,143 @@
-# proxswap_lattice.R
-# ------------------
-# R implementation of the proximity-swap ring lattice construction algorithm.
-# Author: Alexander P. Christensen <alexpaulchristensen@gmail.com>
-# Updated: 24 March 2026
-#
-# License: CC0-1.0
-# To the extent possible under law, the author(s) have dedicated all
-# copyright and related and neighboring rights to this software to the
-# public domain worldwide.  This software is distributed without any
-# warranty.  See <https://creativecommons.org/publicdomain/zero/1.0/>.
-#
-# Functions
-# ---------
-#   proxswap_lattice(network, shuffles)  -- main entry point
-#   build_pairs(distance_matrix, distance_sequence)
-#   proximity_pass(nodes, ring, budget, pairs, distance_sequence)
-#   swapping_pass(nodes, node_sequence, ring, budget, total_budget, distance_sequence)
-#   interleave(index, nodes, distance_sequence)
-
-
-# proxswap_lattice ----
+#' @title Construct a Degree-Preserving Ring Lattice via Proximity-Swap Construction
+#'
+#' @description Converts a network matrix into a connected ring lattice whose
+#' degree sequence exactly matches the original, while maximizing the average
+#' local clustering coefficient. The resulting lattice is intended as a null
+#' model for small-world network analyses. An adjacency matrix is derived
+#' automatically from \code{network} (non-zero entries become edges), so the
+#' function accepts any weighted or binary network directly.
+#'
+#' Each pass randomly permutes the degree sequence onto ring positions, then
+#' greedily assigns edges in strictly increasing ring-distance order (proximity
+#' construction). Any residual degree deficit is resolved by a swap-repair
+#' phase. Passes that yield a disconnected graph or an unsatisfied degree
+#' sequence are discarded; among valid passes the one with the highest average
+#' clustering coefficient is returned. \code{shuffles} independent passes are
+#' attempted in total.
+#'
+#' @param network Matrix.
+#' A square, symmetric numeric matrix representing a network (e.g., partial
+#' correlations). Non-zero off-diagonal entries are treated as edges; the
+#' binary adjacency is derived internally as \code{network != 0}.
+#' Isolated nodes (degree zero) are supported.
+#'
+#' @param weighted Logical (length = 1).
+#' Whether to return a weighted ring lattice. When \code{TRUE}, the edge
+#' weights from \code{network} are reassigned to the lattice edges according
+#' to ring distance following the implementation of Muldoon, Bridgeford, &
+#' Bassett (2016): shorter-distance lattice edges receive larger weights,
+#' preserving the overall weight distribution while concentrating stronger
+#' connections locally. When \code{FALSE} (default), a binary adjacency
+#' matrix is returned.
+#'
+#' @param shuffles Numeric (length = 1).
+#' Number of independent random permutation passes to attempt. Each pass
+#' assigns the observed degree sequence to ring positions in a new random
+#' order, runs the proximity construction, and applies swap repair if needed.
+#' Only passes producing a connected graph with zero degree error are
+#' retained; the one with the highest clustering coefficient is returned.
+#' Defaults to \code{100}.
+#'
+#' @return A square symmetric matrix of the same dimension as \code{network},
+#' with row and column names preserved, representing the resulting ring
+#' lattice. When \code{weighted = FALSE} (default), entries are binary
+#' (\code{TRUE}/\code{FALSE}); when \code{weighted = TRUE}, entries contain
+#' the reassigned edge weights from \code{network}. The average clustering
+#' coefficient of the returned lattice is attached as the attribute \code{"CC"}
+#' and can be retrieved with \code{attr(result, "CC")}.
+#'
+#' @details
+#' ## Algorithm
+#'
+#' \strong{Pair precomputation.} A ring distance matrix is computed as
+#' \eqn{d_{ij} = \min(|i - j|,\, n - |i - j|)}, giving true circular
+#' distances bounded by \eqn{\lfloor n/2 \rfloor}. All unique unordered pairs
+#' at each distance \eqn{r = 1, \ldots, \lfloor n/2 \rfloor} are extracted
+#' once (retaining only entries where \eqn{i < j}) and cached for reuse
+#' across all passes.
+#'
+#' \strong{Proximity construction.} The observed degree sequence is randomly
+#' permuted onto ring positions. Starting from an empty graph, edges are added
+#' in distance order. At each distance band the eligible pairs (both endpoints
+#' have remaining degree budget and are not yet connected) are sorted by
+#' descending \eqn{\min(\text{budget}_i, \text{budget}_j)} so that high-need
+#' pairs receive short connections first. Pairs are then assigned sequentially
+#' with per-pair budget re-checks. The pass exits early once all budgets reach
+#' zero. This phase is implemented in compiled C via \code{proximity_pass_c}.
+#'
+#' \strong{Swap repair.} If any degree deficit remains after the proximity
+#' pass, the highest-deficit node \eqn{i} is connected to its nearest
+#' available ring neighbour, scanning clockwise and counter-clockwise
+#' positions in interleaved distance order. When no direct partner with
+#' remaining budget exists, an edge swap is performed: a nearby unconnected
+#' node \eqn{j} is found, one of \eqn{j}'s existing edges to \eqn{k} is
+#' removed, and a new edge \eqn{(i, j)} is added. Node \eqn{k} recovers its
+#' budget for resolution in a subsequent iteration. This repeats until all
+#' deficits are resolved or the iteration cap (\eqn{2n^2}) is reached. This
+#' phase is implemented in compiled C via \code{swapping_pass_c}.
+#'
+#' \strong{Weight assignment.} When \code{weighted = TRUE}, edge weights are
+#' reassigned after the binary topology is finalised. The observed weights are
+#' ranked and mapped onto lattice edges sorted by ring distance so that
+#' shorter (more local) connections receive larger weights, following Muldoon,
+#' Bridgeford, & Bassett (2016).
+#'
+#' \strong{Pass selection.} A pass is valid only if the resulting graph is
+#' connected and has zero residual degree error. Among valid passes, the one
+#' with the highest average clustering coefficient is returned.
+#'
+#' \strong{Empirical fallback.} If no valid pass is found, or if the best
+#' lattice clustering coefficient is lower than that of the original network,
+#' the empirical adjacency (or weighted matrix, if \code{weighted = TRUE}) is
+#' returned with a warning.
+#'
+#' @references
+#' Muldoon, S. F., Bridgeford, E. W., & Bassett, D. S. (2016).
+#' Small-world propensity and weighted brain connectivity.
+#' \emph{Scientific Reports}, \emph{6}, 22057.
+#' \doi{10.1038/srep22057}
+#'
+#' @examples
+#' # Get network
+#' network <- network_estimation(basic_smallworld)
+#'
+#' # Construct binary ring lattice
+#' L <- proxswap_lattice(network)
+#'
+#' # Retrieve the attached clustering coefficient
+#' attr(L, "CC")
+#'
+#' # Degree sequences should match exactly
+#' cbind(target = colSums(network != 0), achieved = colSums(L))
+#'
+#' # Construct weighted ring lattice
+#' L_weighted <- proxswap_lattice(network, weighted = TRUE)
+#'
+#' # Retrieve the attached clustering coefficient
+#' attr(L_weighted, "CC")
+#'
+#' @author Alexander P. Christensen <alexpaulchristensen@gmail.com>
+#'
+#' @export
+#'
+# Proximity-swap lattice construction ----
 # Updated 24.03.2026
-#
-# Converts a network matrix into a connected ring lattice whose degree sequence
-# exactly matches the original, while maximizing the average local clustering
-# coefficient.
-#
-# An adjacency matrix is derived automatically from 'network' (non-zero entries
-# become edges), so the function accepts any weighted or binary network directly.
-#
-# Each pass randomly permutes the degree sequence onto ring positions, then
-# greedily assigns edges in strictly increasing ring-distance order (proximity
-# construction). Any residual degree deficit is resolved by a swap-repair phase.
-# Passes that yield a disconnected graph or an unsatisfied degree sequence are
-# discarded; among valid passes the one with the highest average clustering
-# coefficient is returned. 'shuffles' independent passes are attempted in total.
-#
-# Arguments
-# ---------
-# network  : Matrix. A square, symmetric numeric matrix representing a network
-#            (e.g., partial correlations). Non-zero off-diagonal entries are
-#            treated as edges; the binary adjacency is derived internally as
-#            (network != 0). Isolated nodes (degree zero) are supported.
-#
-# shuffles : Numeric (length = 1). Number of independent random permutation
-#            passes to attempt. Each pass assigns the observed degree sequence
-#            to ring positions in a new random order, runs the proximity
-#            construction, and applies swap repair if needed. Only passes
-#            producing a connected graph with zero degree error are retained;
-#            the one with the highest clustering coefficient is returned.
-#            Defaults to 100.
-#
-# Returns
-# -------
-# A square symmetric binary adjacency matrix of the same dimension as
-# 'network', with row and column names preserved, representing the resulting
-# ring lattice. The average clustering coefficient of the returned lattice is
-# attached as the attribute "CC" and can be retrieved with attr(result, "CC").
-#
-# Algorithm
-# ---------
-# Pair precomputation:
-#   A ring distance matrix is computed as d_ij = min(|i - j|, n - |i - j|),
-#   giving true circular distances bounded by floor(n / 2). All unique
-#   unordered pairs at each distance r = 1, ..., floor(n / 2) are extracted
-#   once (retaining only entries where i < j) and cached for reuse across all
-#   passes.
-#
-# Proximity construction:
-#   The observed degree sequence is randomly permuted onto ring positions.
-#   Starting from an empty graph, edges are added in distance order. At each
-#   distance band the eligible pairs (both endpoints have remaining degree
-#   budget and are not yet connected) are sorted by descending
-#   min(budget_i, budget_j) so that high-need pairs receive short connections
-#   first. Pairs are then assigned sequentially with per-pair budget re-checks.
-#   The pass exits early once all budgets reach zero.
-#
-# Swap repair:
-#   If any degree deficit remains after the proximity pass, the
-#   highest-deficit node i is connected to its nearest available ring
-#   neighbour, scanning clockwise and counter-clockwise positions in
-#   interleaved distance order. When no direct partner with remaining budget
-#   exists, an edge swap is performed: a nearby unconnected node j is found,
-#   one of j's existing edges to k is removed, and a new edge (i, j) is added.
-#   Node k recovers its budget for resolution in a subsequent iteration. This
-#   repeats until all deficits are resolved or the iteration cap (2n^2) is
-#   reached.
-#
-# Pass selection:
-#   A pass is valid only if the resulting graph is connected and has zero
-#   residual degree error. Among valid passes, the one with the highest average
-#   clustering coefficient is returned.
-#
-# Empirical fallback:
-#   If no valid pass is found, or if the best lattice clustering coefficient is
-#   lower than that of the original network, the empirical adjacency is
-#   returned with a warning.
-#
-# Examples
-# --------
-# # Get network
-# network <- network_estimation(basic_smallworld)
-#
-# # Construct ring lattice
-# L <- proxswap_lattice(network)
-#
-# # Retrieve the attached clustering coefficient
-# attr(L, "CC")
-#
-# # Degree sequences should match exactly
-# cbind(target = colSums(network != 0), achieved = colSums(L))
-#
-proxswap_lattice <- function(network, shuffles = 100)
+proxswap_lattice <- function(network, weighted = FALSE, shuffles = 100)
 {
+
+  # Ensure network is in absolute values
+  network <- abs(network)
 
   # Automatically construct adjacency
   A <- network != 0
 
+  # Check for weighted
+  if(!weighted){
+    network <- A
+  }
+
   # Get nodes and degree
-  nodes  <- dim(A)[2]
+  nodes  <- dim(network)[2]
   degree <- colSums(A)
 
   # Set up distance matrix
@@ -131,7 +150,7 @@ proxswap_lattice <- function(network, shuffles = 100)
   pairs <- build_pairs(distance_matrix, distance_sequence)
 
   # Compute empirical clustering coefficient for fallback check
-  empirical_CC <- igraph::transitivity(L0ggm:::convert2igraph(A), type = "average")
+  empirical_CC <- igraph::transitivity(convert2igraph(network), type = "average")
 
   # Initialize best result trackers
   best_swap <- best_ring <- NULL
@@ -144,7 +163,7 @@ proxswap_lattice <- function(network, shuffles = 100)
   for(k in seq_len(shuffles)){
 
     # Store swap order (returns proper degree sequence)
-    swap_order <- L0ggm:::shuffle(node_sequence)
+    swap_order <- shuffle(node_sequence)
 
     # Run proximity construction with shuffled degrees
     result <- proximity_pass(
@@ -160,11 +179,22 @@ proxswap_lattice <- function(network, shuffles = 100)
     )
 
     # Convert ring to {igraph}
-    iring <- L0ggm:::convert2igraph(result$ring)
+    iring <- convert2igraph(result$ring)
 
     # Skip passes with residual or fully connected
     if((!igraph::is_connected(iring)) || (result$remaining > 0)){
       next
+    }
+
+    # Check for weighted
+    if(weighted){
+
+      # Get weights
+      result$ring <- assign_weights(network, result$ring)
+
+      # Update ring to {igraph}
+      iring <- convert2igraph(result$ring)
+
     }
 
     # With success, compute clustering coefficient for this pass
@@ -191,44 +221,28 @@ proxswap_lattice <- function(network, shuffles = 100)
 
   # Select between lattice and empirical
   original_order <- order(best_swap)
-  ring <- L0ggm:::swiftelse(empirical_flag, A, best_ring[original_order, original_order])
+
+  # Check for empirical and weighted
+  ring <- swiftelse(
+    empirical_flag,
+    swiftelse(weighted, network, A),
+    best_ring[original_order, original_order]
+  )
 
   # Ensure named matrix
   dimnames(ring) <- dimnames(network)
 
   # Attach clustering coefficient
-  attr(ring, "CC") <- L0ggm:::swiftelse(empirical_flag, empirical_CC, best_CC)
+  attr(ring, "CC") <- swiftelse(empirical_flag, empirical_CC, best_CC)
 
   # Return ring
   return(ring)
 
 }
 
-# build_pairs ----
+#' @noRd
+# Pre-compute unique node pairs per ring distance ----
 # Updated 24.03.2026
-#
-# Pre-computes all unique upper-triangle node pairs at each ring distance.
-#
-# For a ring of n nodes the circular distance between positions i and j is
-# min(|i - j|, n - |i - j|). This helper extracts, for every integer distance
-# r = 1, ..., floor(n / 2), the set of unordered pairs {i, j} (i < j) that
-# sit exactly r steps apart on the ring. Results are cached once and reused
-# across all shuffle passes in proxswap_lattice().
-#
-# Arguments
-# ---------
-# distance_matrix   : n x n integer matrix where entry [i, j] holds the
-#                     circular ring distance between nodes i and j.
-# distance_sequence : Integer vector 1:max(distance_matrix) enumerating every
-#                     distinct ring distance to process.
-#
-# Returns
-# -------
-# A list of length length(distance_sequence). Element [[r]] is a two-column
-# integer matrix with columns "row" and "col" (both 1-indexed) listing every
-# pair of nodes at ring distance r with row < col. Distances with no pairs
-# (possible at r = n/2 for even n) return an empty matrix.
-#
 build_pairs <- function(distance_matrix, distance_sequence)
 {
 
@@ -236,52 +250,21 @@ build_pairs <- function(distance_matrix, distance_sequence)
   return(
     lapply(distance_sequence, function(i){
 
-        # Obtain pairs
-        pairs <- which(distance_matrix == i, arr.ind = TRUE)
+      # Obtain pairs
+      pairs <- which(distance_matrix == i, arr.ind = TRUE)
 
-        # Return pairs
-        return(pairs[pairs[,"row"] < pairs[,"col"],])
+      # Return pairs
+      return(pairs[pairs[,"row"] < pairs[,"col"],])
 
-      }
+    }
     )
   )
 
 }
 
-# proximity_pass ----
+#' @noRd
+# Proximity construction ----
 # Updated 24.03.2026
-#
-# Greedily assigns edges in strictly increasing ring-distance order.
-#
-# Starting from the supplied (initially empty) ring adjacency, edges are added
-# one distance band at a time. Within each band, eligible pairs -- those where
-# both endpoints still have remaining degree budget and are not yet connected --
-# are sorted by descending min(budget_i, budget_j) so that the most
-# degree-deficient pairs receive the shortest available connections first. Each
-# pair is then considered in that order, with budgets re-checked immediately
-# before assignment because earlier placements in the same band can exhaust a
-# node's budget. The loop exits early once all degree budgets reach zero.
-#
-# Arguments
-# ---------
-# nodes             : Integer. Number of nodes in the ring.
-# ring              : Logical n x n adjacency matrix (typically all FALSE at
-#                     the start of a pass).
-# budget            : Integer vector of length n giving the remaining degree
-#                     deficit for each node under the shuffled assignment.
-# pairs             : List produced by build_pairs(); element [[r]] contains
-#                     all upper-triangle pairs at ring distance r.
-# distance_sequence : Integer vector 1:max_distance controlling the order in
-#                     which distance bands are processed.
-#
-# Returns
-# -------
-# A named list with three elements:
-#   ring         -- updated logical n x n adjacency matrix.
-#   budget       -- updated integer degree-deficit vector (zeros if fully
-#                   satisfied).
-#   total_budget -- integer sum of remaining deficits (0 on full success).
-#
 proximity_pass <- function(nodes, ring, budget, pairs, distance_sequence)
 {
 
@@ -350,47 +333,9 @@ proximity_pass <- function(nodes, ring, budget, pairs, distance_sequence)
 
 }
 
-# swapping_pass ----
+#' @noRd
+# Swap to amend lattice ----
 # Updated 24.03.2026
-#
-# Resolves any residual degree deficit remaining after proximity_pass().
-#
-# At each iteration the node with the largest remaining deficit (i) is
-# targeted. Ring positions are scanned in interleaved clockwise /
-# counter-clockwise order (nearest first) to find a connection for i:
-#
-#   Direct connection: if any scanned node j has remaining budget and is not
-#   yet connected to i, the edge (i, j) is added immediately and the
-#   iteration continues.
-#
-#   Edge swap: if no direct partner exists, the scan finds the nearest
-#   unconnected node j that has at least one existing neighbour k not already
-#   connected to i. The edge (j, k) is removed and (i, j) is added. Node k
-#   recovers its budget and will be re-targeted in a later iteration. Because
-#   one deficit is transferred rather than eliminated, total_budget is
-#   unchanged by a swap.
-#
-# Iteration stops when total_budget reaches zero, when no swap can be found,
-# or after the hard cap of 2 * n^2 iterations.
-#
-# Arguments
-# ---------
-# nodes             : Integer. Number of nodes in the ring.
-# node_sequence     : Integer vector 1:nodes used for neighbourhood lookup.
-# ring              : Logical or integer n x n adjacency matrix, as returned
-#                     by proximity_pass().
-# budget            : Integer degree-deficit vector, as returned by
-#                     proximity_pass().
-# total_budget      : Integer sum of budget, as returned by proximity_pass().
-# distance_sequence : Integer vector 1:floor(n/2) passed to interleave() to
-#                     control the clockwise / counter-clockwise scan order.
-#
-# Returns
-# -------
-# A named list with two elements:
-#   ring      -- updated logical n x n adjacency matrix.
-#   remaining -- integer total unresolved degree deficit (0 on full success).
-#
 swapping_pass <- function(nodes, node_sequence, ring, budget, total_budget, distance_sequence)
 {
 
@@ -483,35 +428,8 @@ swapping_pass <- function(nodes, node_sequence, ring, budget, total_budget, dist
 
 }
 
-# interleave ----
+# Interleaving function ----
 # Updated 24.03.2026
-#
-# Generates an interleaved sequence of ring positions around a given node,
-# alternating between clockwise and counter-clockwise neighbours in strictly
-# increasing distance order.
-#
-# For a node at position 'index' on a ring of 'nodes' positions, the function
-# pairs each distance d in 'distance_sequence' with its clockwise neighbour
-# at (index - 1 + d) %% nodes + 1 and its counter-clockwise neighbour at
-# (index - 1 - d + nodes * d) %% nodes + 1. The two sequences are interleaved
-# via rbind() so positions closest to 'index' appear first. Duplicate entries
-# (which occur at distance floor(n / 2) when n is even and the two directions
-# meet) are removed by unique().
-#
-# Arguments
-# ---------
-# index             : Integer (1-indexed). The focal node whose neighbourhood
-#                     is being enumerated.
-# nodes             : Integer. Total number of nodes on the ring.
-# distance_sequence : Integer vector 1:floor(n/2) giving the ring distances
-#                     to include.
-#
-# Returns
-# -------
-# An integer vector of node indices (1-indexed, no duplicates) ordered by
-# ascending ring distance from 'index', with clockwise positions preceding
-# counter-clockwise positions within each distance tier.
-#
 interleave <- function(index, nodes, distance_sequence)
 {
 
@@ -526,5 +444,32 @@ interleave <- function(index, nodes, distance_sequence)
       )
     )
   )
+
+}
+
+#' @noRd
+# Assign weights based on distance ----
+# Updated 25.03.2026
+assign_weights <- function(network, A)
+{
+
+  # Obtain weights
+  lower_triangle <- lower.tri(network)
+  network_nonzero <- network[lower_triangle] != 0
+  weights <- network[lower_triangle][network_nonzero]
+
+  # Set weights
+  A_nonzero <- A[lower_triangle] != 0
+  distance <- as.matrix(dist(A))
+
+  # Set weights order
+  # Follows: Muldoon, Bridgeford, & Bassett's (2016) implementation
+  weight_order <- rank(distance[lower_triangle][A_nonzero], ties.method = "random")
+  A[lower_triangle][A_nonzero] <- weights[weight_order]
+  A[!lower_triangle] <- 0
+  A <- A + t(A) # make symmetric
+
+  # Return weighted lattice
+  return(A)
 
 }

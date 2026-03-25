@@ -24,20 +24,26 @@ networkx  -- required for clustering-coefficient and connectivity checks;
 
 Functions
 ---------
-proxswap_lattice(network, shuffles)  -- main entry point
+proxswap_lattice(network, weighted, shuffles)  -- main entry point
 _build_pairs(D, distance_seq)
 _proximity_pass(nodes, ring, budget, pairs, distance_seq)
 _swapping_pass(nodes, ring, budget, total_budget)
+_assign_weights(network, A, rng)
 
 Usage
 -----
     import numpy as np
     from proxswap_lattice import proxswap_lattice
 
+    # Binary lattice (default)
     ring, cc = proxswap_lattice(network, shuffles=100)
     print("Average clustering coefficient:", cc)
     print("Degree sequences match:", np.array_equal(network.astype(bool).sum(axis=0),
                                                      ring.sum(axis=0)))
+
+    # Weighted lattice
+    ring_w, cc_w = proxswap_lattice(network, weighted=True, shuffles=100)
+    print("Weighted average clustering coefficient:", cc_w)
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ import networkx as nx
 
 def proxswap_lattice(
     network: np.ndarray,
+    weighted: bool = False,
     shuffles: int = 100,
 ) -> tuple[np.ndarray, float]:
     """Construct a degree-preserving ring lattice via proximity-swap construction.
@@ -66,9 +73,19 @@ def proxswap_lattice(
     ----------
     network : ndarray, shape (n, n)
         Square, symmetric numeric matrix representing a network (e.g. partial
-        correlations).  Non-zero off-diagonal entries are treated as edges; the
-        binary adjacency is derived internally as ``network != 0``.
+        correlations).  Absolute values are taken internally, so signed weights
+        are handled automatically.  Non-zero off-diagonal entries are treated as
+        edges; the binary adjacency is derived internally as ``network != 0``.
         Isolated nodes (degree zero) are supported.
+    weighted : bool, optional
+        Whether to return a weighted ring lattice.  When ``True``, edge weights
+        from ``network`` are reassigned to the lattice topology following
+        Muldoon, Bridgeford, & Bassett (2016): shorter-distance lattice edges
+        receive larger weights, preserving the overall weight distribution.
+        The clustering coefficient is computed via
+        ``nx.average_clustering(..., weight='weight')``.  When ``False``
+        (default), a binary ``bool`` adjacency matrix is returned and the
+        unweighted clustering coefficient is used throughout.
     shuffles : int, optional
         Number of independent random permutation passes to attempt.  Only
         passes producing a connected graph with zero degree error are retained;
@@ -77,9 +94,14 @@ def proxswap_lattice(
 
     Returns
     -------
-    ring : ndarray of bool, shape (n, n)
-        Symmetric binary adjacency matrix representing the ring lattice with
-        the best average clustering coefficient found.
+    ring : ndarray, shape (n, n)
+        Symmetric matrix representing the ring lattice with the best average
+        clustering coefficient found.  When ``weighted=False`` (default),
+        dtype is ``bool``.  When ``weighted=True``, dtype is ``float64`` and
+        entries contain the reassigned edge weights from ``network``.  When
+        the empirical fallback is taken, ``ring`` equals the binarised input
+        (``weighted=False``) or the absolute-value input matrix
+        (``weighted=True``).
     cc : float
         Average clustering coefficient of ``ring``.  Equals the empirical CC
         when the empirical-fallback path is taken.
@@ -96,19 +118,28 @@ def proxswap_lattice(
     3. **Swap repair** – any residual deficit is resolved by direct connection
        or an edge swap, scanning interleaved clockwise / counter-clockwise
        ring positions.
-    4. **Pass selection** – only connected, zero-deficit passes are kept; the
+    4. **Weight assignment** – when ``weighted=True``, edge weights are
+       reassigned after the binary topology is finalised via
+       ``_assign_weights``.
+    5. **Pass selection** – only connected, zero-deficit passes are kept; the
        highest-CC pass is returned.
-    5. **Empirical fallback** – if no valid pass beats the empirical CC, the
-       original adjacency is returned with a warning.
+    6. **Empirical fallback** – if no valid pass beats the empirical CC, the
+       original adjacency (or weighted matrix) is returned with a warning.
 
     Dependencies
     ~~~~~~~~~~~~
     ``nx.average_clustering`` – computes the average local clustering
     coefficient over all nodes; mirrors ``igraph::transitivity(type="average")``.
+    Accepts a ``weight`` keyword for weighted graphs.
 
     ``nx.is_connected`` – confirms that the graph has exactly one connected
     component; mirrors ``igraph::is_connected``.
     """
+    # ------------------------------------------------------------------
+    # Ensure absolute values (handles signed weight matrices)
+    # ------------------------------------------------------------------
+    network = np.abs(network)
+
     # ------------------------------------------------------------------
     # Derive binary adjacency
     # ------------------------------------------------------------------
@@ -134,8 +165,14 @@ def proxswap_lattice(
     # Empirical clustering coefficient (fallback reference).
     # nx.average_clustering averages over all nodes, matching
     # igraph::transitivity(type="average").
+    # When weighted, pass weight="weight" to use edge weights.
     # ------------------------------------------------------------------
-    empirical_CC = nx.average_clustering(nx.from_numpy_array(A.astype(float)))
+    if weighted:
+        empirical_CC = nx.average_clustering(
+            nx.from_numpy_array(network), weight="weight"
+        )
+    else:
+        empirical_CC = nx.average_clustering(nx.from_numpy_array(A.astype(float)))
 
     # ------------------------------------------------------------------
     # Initialise best-pass trackers
@@ -171,14 +208,20 @@ def proxswap_lattice(
         if res["remaining"] > 0 or not nx.is_connected(G_pass):
             continue
 
-        # Clustering coefficient for this valid pass.
-        # Reuse the graph already built for the connectivity check.
-        pass_CC = nx.average_clustering(G_pass)
+        # Assign weights to the valid binary topology when requested.
+        # pass_ring is float64 with reassigned weights; otherwise bool.
+        if weighted:
+            pass_ring = _assign_weights(network, res["ring"], rng)
+            G_pass    = nx.from_numpy_array(pass_ring)
+            pass_CC   = nx.average_clustering(G_pass, weight="weight")
+        else:
+            pass_ring = res["ring"].copy()
+            pass_CC   = nx.average_clustering(G_pass)
 
         # Keep the best
         if pass_CC > best_CC:
             best_CC   = pass_CC
-            best_ring = res["ring"].copy()
+            best_ring = pass_ring
             best_swap = swap_order.copy()
 
     # ------------------------------------------------------------------
@@ -198,14 +241,16 @@ def proxswap_lattice(
     # Restore original node ordering  (invert the permutation)
     # ------------------------------------------------------------------
     if empirical_flag:
-        ring = A.astype(bool)
+        # Return weighted matrix or binary adjacency depending on mode
+        ring = network if weighted else A.astype(bool)
         cc   = empirical_CC
     else:
         # original_order is the inverse permutation of best_swap:
         #   best_swap[original_order] == arange(nodes)
         original_order = np.empty(nodes, dtype=int)
         original_order[best_swap] = np.arange(nodes)
-        ring = best_ring[np.ix_(original_order, original_order)].astype(bool)
+        reordered = best_ring[np.ix_(original_order, original_order)]
+        ring = reordered if weighted else reordered.astype(bool)
         cc   = best_CC
 
     return ring, cc
@@ -441,3 +486,77 @@ def _swapping_pass(
     return {"ring": ring.astype(bool), "remaining": int(total_budget)}
 
 
+
+# =============================================================================
+# _assign_weights
+# =============================================================================
+
+def _assign_weights(
+    network: np.ndarray,
+    A:       np.ndarray,
+    rng:     np.random.Generator,
+) -> np.ndarray:
+    """Reassign edge weights from ``network`` onto the binary lattice ``A``.
+
+    Translated from ``assign_weights()`` in ``proxswap_lattice.R``.
+
+    Following Muldoon, Bridgeford, & Bassett (2016): edge weights are mapped
+    onto the lattice such that shorter-distance lattice edges (quantified by
+    Euclidean distance between adjacency-row profiles) receive larger weights,
+    preserving the overall weight distribution of the original network.
+
+    Parameters
+    ----------
+    network : ndarray, shape (n, n)
+        The original weighted network (absolute values assumed already taken
+        by the caller).  Non-zero lower-triangle entries supply the weight pool.
+    A : ndarray, shape (n, n)
+        Binary adjacency matrix (the lattice topology as returned by
+        ``_swapping_pass``).  May be ``bool`` or integer.
+    rng : numpy.random.Generator
+        Random generator passed in from ``proxswap_lattice`` so that weight
+        assignment participates in the same reproducible stream.
+
+    Returns
+    -------
+    result : ndarray of float64, shape (n, n)
+        Symmetric weighted matrix with reassigned edge weights.
+    """
+    n = network.shape[0]
+
+    # Lower-triangle mask (strict: excludes diagonal), matching R's lower.tri()
+    lt_rows, lt_cols = np.tril_indices(n, k=-1)
+
+    # Extract non-zero weights from lower triangle of network
+    net_lt  = network[lt_rows, lt_cols]
+    weights = net_lt[net_lt != 0]                       # weight pool
+
+    # Identify non-zero edges in lower triangle of A
+    A_lt      = A[lt_rows, lt_cols].astype(float)
+    A_nz_mask = A_lt != 0
+
+    # Pairwise Euclidean distances between adjacency-row profiles of A.
+    # Mirrors R's as.matrix(dist(A)).
+    A_f          = A.astype(float)
+    sq           = (A_f ** 2).sum(axis=1)
+    dist_matrix  = np.sqrt(np.maximum(
+        sq[:, None] + sq[None, :] - 2.0 * (A_f @ A_f.T), 0.0
+    ))
+    edge_dists = dist_matrix[lt_rows, lt_cols][A_nz_mask]
+
+    # Random-tiebreak rank, mirroring R's rank(..., ties.method = "random"):
+    # shuffle indices, stable-sort the shuffled distances, then invert.
+    n_edges  = edge_dists.size
+    rp       = rng.permutation(n_edges)
+    sort_idx = np.argsort(edge_dists[rp], kind="stable")
+    weight_order          = np.empty(n_edges, dtype=int)
+    weight_order[rp[sort_idx]] = np.arange(n_edges)    # 0-based ranks
+
+    # Write weights into lower triangle, zero upper triangle, symmetrise
+    lt_vals             = np.zeros(lt_rows.size)
+    lt_vals[A_nz_mask]  = weights[weight_order]
+    result              = np.zeros((n, n), dtype=float)
+    result[lt_rows, lt_cols] = lt_vals
+    result              = result + result.T              # symmetric
+
+    return result
