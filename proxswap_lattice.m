@@ -23,7 +23,7 @@
 %   build_pairs(D, distance_seq)
 %   proximity_pass(nodes, ring, budget, pairs, distance_seq)
 %   swapping_pass(nodes, ring, budget, total_budget)
-%   assign_weights(network, A)
+%   assign_weights(network, A, D)
 
 function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 % PROXSWAP_LATTICE  Construct a degree-preserving ring lattice via
@@ -49,13 +49,14 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 %              as (network ~= 0).  Isolated nodes (degree zero) are
 %              supported.
 %   weighted : logical scalar, whether to return a weighted lattice
-%              (default false).  When true, edge weights from NETWORK are
-%              reassigned to the lattice topology following Muldoon,
-%              Bridgeford, & Bassett (2016): shorter-distance lattice edges
-%              receive larger weights, preserving the overall weight
-%              distribution.  The clustering coefficient is then computed
-%              via clustering_coef_wu (BCT) rather than clustering_coef_bu.
-%              When false, a binary logical adjacency matrix is returned.
+%              (default false).  When true, observed edge weights from NETWORK
+%              are sorted in descending order and mapped onto lattice edges
+%              ranked by ascending ring distance, so that shorter (more local)
+%              connections receive the largest weights, following Muldoon,
+%              Bridgeford, & Bassett (2016).  The clustering coefficient is
+%              then computed via clustering_coef_wu (BCT) rather than
+%              clustering_coef_bu.  When false, a binary logical adjacency
+%              matrix is returned.
 %   shuffles : positive integer, number of independent random permutation
 %              passes to attempt (default 100).  Only passes producing a
 %              connected graph with zero degree error are retained; the one
@@ -83,8 +84,11 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 %   3. Swap repair           -- any residual deficit is resolved by direct
 %      connection or an edge swap, scanning interleaved clockwise /
 %      counter-clockwise positions.
-%   4. Weight assignment     -- when WEIGHTED is true, edge weights are
-%      reassigned after the binary topology is finalised via ASSIGN_WEIGHTS.
+%   4. Weight assignment     -- when WEIGHTED is true, observed weights are
+%      sorted descending and mapped onto lattice edges ranked by ascending
+%      ring distance (d_ij = min(|i-j|, n-|i-j|)), so that shorter
+%      connections receive the largest weights.  Ties in ring distance are
+%      broken at random.  Implemented in ASSIGN_WEIGHTS.
 %   5. Pass selection        -- only connected, zero-deficit passes are
 %      kept; the highest-CC pass is returned.
 %   6. Empirical fallback    -- if no valid pass beats the empirical CC,
@@ -179,7 +183,7 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
         % Assign weights to the valid binary topology when requested
         pass_ring = result.ring;
         if weighted
-            pass_ring = assign_weights(network, pass_ring);
+            pass_ring = assign_weights(network, pass_ring, D);
         end
 
         % Clustering coefficient for this valid pass.
@@ -532,15 +536,17 @@ end % swapping_pass
 % ==========================================================================
 %  assign_weights
 % ==========================================================================
-function A = assign_weights(network, A)
+function A = assign_weights(network, A, D)
 % ASSIGN_WEIGHTS  Reassign edge weights from NETWORK onto the binary lattice A.
 %
 %   Translated from assign_weights() in proxswap_lattice.R.
 %
-%   Following Muldoon, Bridgeford, & Bassett (2016): edge weights are mapped
-%   onto the lattice such that shorter-distance lattice edges (quantified by
-%   Euclidean distance between adjacency-row profiles) receive larger weights,
-%   preserving the overall weight distribution of the original network.
+%   Following Muldoon, Bridgeford, & Bassett (2016): observed edge weights are
+%   sorted in descending order and mapped onto lattice edges ranked by ascending
+%   ring distance (d_ij = min(|i-j|, n-|i-j|)), so that shorter (more local)
+%   connections receive the largest weights.  This uses the ring's structural
+%   distances directly rather than any network-derived proxy.  Ties in ring
+%   distance are broken at random.
 %
 %   Arguments
 %   ---------
@@ -549,6 +555,8 @@ function A = assign_weights(network, A)
 %             triangle entries supply the weight pool.
 %   A       : n x n logical or numeric binary adjacency matrix (the lattice
 %             topology, as returned by swapping_pass).
+%   D       : n x n integer matrix where entry (i, j) holds the circular ring
+%             distance between nodes i and j, as computed in proxswap_lattice.
 %
 %   Returns
 %   -------
@@ -559,19 +567,19 @@ function A = assign_weights(network, A)
     % Lower-triangle mask (strict: excludes diagonal)
     lt_mask = logical(tril(ones(n), -1));
 
-    % Extract non-zero weights from lower triangle of network
+    % Extract non-zero weights from lower triangle of network, sorted descending.
+    % Mirrors R: weights <- sort(network[lower_triangle][network_nonzero], decreasing = TRUE)
     net_lt  = network(lt_mask);
-    weights = net_lt(net_lt ~= 0);          % weight pool (column vector)
+    weights = sort(net_lt(net_lt ~= 0), 'descend');  % column vector, descending
 
     % Identify non-zero edges in lower triangle of A
     A_lt      = double(A(lt_mask));
     A_nz_mask = A_lt ~= 0;                  % logical index into lt values
 
-    % Pairwise Euclidean distances between adjacency-row profiles of A.
-    % squareform(pdist(A)) mirrors R's as.matrix(dist(A)).
-    dist_matrix = squareform(pdist(double(A)));
-    dist_lt     = dist_matrix(lt_mask);
-    edge_dists  = dist_lt(A_nz_mask);       % distances for lattice edges
+    % Ring distances for lattice edges, taken directly from the precomputed
+    % distance matrix.  Mirrors R: distance_matrix[lower_triangle][A_nonzero]
+    dist_lt    = D(lt_mask);
+    edge_dists = dist_lt(A_nz_mask);        % distances for lattice edges
 
     % Random-tiebreak rank, mirroring R's rank(..., ties.method = "random"):
     %   shuffle the distances, sort, then invert to obtain ranks.

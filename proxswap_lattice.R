@@ -63,7 +63,7 @@
 #' descending \eqn{\min(\text{budget}_i, \text{budget}_j)} so that high-need
 #' pairs receive short connections first. Pairs are then assigned sequentially
 #' with per-pair budget re-checks. The pass exits early once all budgets reach
-#' zero. This phase is implemented in compiled C via \code{proximity_pass_c}.
+#' zero.
 #'
 #' \strong{Swap repair.} If any degree deficit remains after the proximity
 #' pass, the highest-deficit node \eqn{i} is connected to its nearest
@@ -73,14 +73,16 @@
 #' node \eqn{j} is found, one of \eqn{j}'s existing edges to \eqn{k} is
 #' removed, and a new edge \eqn{(i, j)} is added. Node \eqn{k} recovers its
 #' budget for resolution in a subsequent iteration. This repeats until all
-#' deficits are resolved or the iteration cap (\eqn{2n^2}) is reached. This
-#' phase is implemented in compiled C via \code{swapping_pass_c}.
+#' deficits are resolved or the iteration cap (\eqn{2n^2}) is reached.
 #'
 #' \strong{Weight assignment.} When \code{weighted = TRUE}, edge weights are
 #' reassigned after the binary topology is finalised. The observed weights are
-#' ranked and mapped onto lattice edges sorted by ring distance so that
-#' shorter (more local) connections receive larger weights, following Muldoon,
-#' Bridgeford, & Bassett (2016).
+#' sorted in descending order and mapped onto lattice edges ranked by ascending
+#' ring distance (i.e., \eqn{d_{ij} = \min(|i - j|,\, n - |i - j|)}), so that
+#' shorter (more local) connections receive the largest weights. This directly
+#' implements the distance-weight principle of Muldoon, Bridgeford, & Bassett
+#' (2016), using the ring's structural distances rather than any network-derived
+#' proxy. Ties in ring distance are broken at random.
 #'
 #' \strong{Pass selection.} A pass is valid only if the resulting graph is
 #' connected and has zero residual degree error. Among valid passes, the one
@@ -190,7 +192,7 @@ proxswap_lattice <- function(network, weighted = FALSE, shuffles = 100)
     if(weighted){
 
       # Get weights
-      result$ring <- assign_weights(network, result$ring)
+      result$ring <- assign_weights(network, result$ring, distance_matrix)
 
       # Update ring to {igraph}
       iring <- convert2igraph(result$ring)
@@ -450,21 +452,20 @@ interleave <- function(index, nodes, distance_sequence)
 #' @noRd
 # Assign weights based on distance ----
 # Updated 25.03.2026
-assign_weights <- function(network, A)
+assign_weights <- function(network, A, distance_matrix)
 {
 
   # Obtain weights
   lower_triangle <- lower.tri(network)
   network_nonzero <- network[lower_triangle] != 0
-  weights <- network[lower_triangle][network_nonzero]
+  weights <- sort(network[lower_triangle][network_nonzero], decreasing = TRUE)
 
   # Set weights
   A_nonzero <- A[lower_triangle] != 0
-  distance <- as.matrix(dist(A))
 
   # Set weights order
   # Follows: Muldoon, Bridgeford, & Bassett's (2016) implementation
-  weight_order <- rank(distance[lower_triangle][A_nonzero], ties.method = "random")
+  weight_order <- rank(distance_matrix[lower_triangle][A_nonzero], ties.method = "random")
   A[lower_triangle][A_nonzero] <- weights[weight_order]
   A[!lower_triangle] <- 0
   A <- A + t(A) # make symmetric

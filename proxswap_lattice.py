@@ -28,7 +28,7 @@ proxswap_lattice(network, weighted, shuffles)  -- main entry point
 _build_pairs(D, distance_seq)
 _proximity_pass(nodes, ring, budget, pairs, distance_seq)
 _swapping_pass(nodes, ring, budget, total_budget)
-_assign_weights(network, A, rng)
+_assign_weights(network, A, distance_matrix, rng)
 
 Usage
 -----
@@ -80,9 +80,10 @@ def proxswap_lattice(
     weighted : bool, optional
         Whether to return a weighted ring lattice.  When ``True``, edge weights
         from ``network`` are reassigned to the lattice topology following
-        Muldoon, Bridgeford, & Bassett (2016): shorter-distance lattice edges
-        receive larger weights, preserving the overall weight distribution.
-        The clustering coefficient is computed via
+        Muldoon, Bridgeford, & Bassett (2016): observed weights are sorted in
+        descending order and mapped onto lattice edges ranked by ascending ring
+        distance, so that shorter (more local) connections receive the largest
+        weights.  The clustering coefficient is computed via
         ``nx.average_clustering(..., weight='weight')``.  When ``False``
         (default), a binary ``bool`` adjacency matrix is returned and the
         unweighted clustering coefficient is used throughout.
@@ -118,9 +119,11 @@ def proxswap_lattice(
     3. **Swap repair** – any residual deficit is resolved by direct connection
        or an edge swap, scanning interleaved clockwise / counter-clockwise
        ring positions.
-    4. **Weight assignment** – when ``weighted=True``, edge weights are
-       reassigned after the binary topology is finalised via
-       ``_assign_weights``.
+    4. **Weight assignment** – when ``weighted=True``, observed weights are
+       sorted descending and mapped onto lattice edges ranked by ascending ring
+       distance (``d_ij = min(|i-j|, n-|i-j|)``), so that shorter connections
+       receive the largest weights.  Ties in ring distance are broken at random.
+       Implemented in ``_assign_weights``.
     5. **Pass selection** – only connected, zero-deficit passes are kept; the
        highest-CC pass is returned.
     6. **Empirical fallback** – if no valid pass beats the empirical CC, the
@@ -211,7 +214,7 @@ def proxswap_lattice(
         # Assign weights to the valid binary topology when requested.
         # pass_ring is float64 with reassigned weights; otherwise bool.
         if weighted:
-            pass_ring = _assign_weights(network, res["ring"], rng)
+            pass_ring = _assign_weights(network, res["ring"], D, rng)
             G_pass    = nx.from_numpy_array(pass_ring)
             pass_CC   = nx.average_clustering(G_pass, weight="weight")
         else:
@@ -492,18 +495,21 @@ def _swapping_pass(
 # =============================================================================
 
 def _assign_weights(
-    network: np.ndarray,
-    A:       np.ndarray,
-    rng:     np.random.Generator,
+    network:         np.ndarray,
+    A:               np.ndarray,
+    distance_matrix: np.ndarray,
+    rng:             np.random.Generator,
 ) -> np.ndarray:
     """Reassign edge weights from ``network`` onto the binary lattice ``A``.
 
     Translated from ``assign_weights()`` in ``proxswap_lattice.R``.
 
-    Following Muldoon, Bridgeford, & Bassett (2016): edge weights are mapped
-    onto the lattice such that shorter-distance lattice edges (quantified by
-    Euclidean distance between adjacency-row profiles) receive larger weights,
-    preserving the overall weight distribution of the original network.
+    Following Muldoon, Bridgeford, & Bassett (2016): observed edge weights are
+    sorted in descending order and mapped onto lattice edges ranked by ascending
+    ring distance (``d_ij = min(|i-j|, n-|i-j|)``), so that shorter (more
+    local) connections receive the largest weights.  This uses the ring's
+    structural distances directly rather than any network-derived proxy.
+    Ties in ring distance are broken at random.
 
     Parameters
     ----------
@@ -513,6 +519,11 @@ def _assign_weights(
     A : ndarray, shape (n, n)
         Binary adjacency matrix (the lattice topology as returned by
         ``_swapping_pass``).  May be ``bool`` or integer.
+    distance_matrix : ndarray of int, shape (n, n)
+        Circular ring distance matrix where entry [i, j] holds the ring
+        distance between nodes i and j.  Passed in from ``proxswap_lattice``
+        so that weight assignment uses the same distance structure as the
+        proximity construction.
     rng : numpy.random.Generator
         Random generator passed in from ``proxswap_lattice`` so that weight
         assignment participates in the same reproducible stream.
@@ -527,22 +538,18 @@ def _assign_weights(
     # Lower-triangle mask (strict: excludes diagonal), matching R's lower.tri()
     lt_rows, lt_cols = np.tril_indices(n, k=-1)
 
-    # Extract non-zero weights from lower triangle of network
+    # Extract non-zero weights from lower triangle of network, sorted descending.
+    # Mirrors R: weights <- sort(network[lower_triangle][network_nonzero], decreasing = TRUE)
     net_lt  = network[lt_rows, lt_cols]
-    weights = net_lt[net_lt != 0]                       # weight pool
+    weights = np.sort(net_lt[net_lt != 0])[::-1]        # descending
 
     # Identify non-zero edges in lower triangle of A
     A_lt      = A[lt_rows, lt_cols].astype(float)
     A_nz_mask = A_lt != 0
 
-    # Pairwise Euclidean distances between adjacency-row profiles of A.
-    # Mirrors R's as.matrix(dist(A)).
-    A_f          = A.astype(float)
-    sq           = (A_f ** 2).sum(axis=1)
-    dist_matrix  = np.sqrt(np.maximum(
-        sq[:, None] + sq[None, :] - 2.0 * (A_f @ A_f.T), 0.0
-    ))
-    edge_dists = dist_matrix[lt_rows, lt_cols][A_nz_mask]
+    # Ring distances for lattice edges, taken directly from the precomputed
+    # distance matrix.  Mirrors R: distance_matrix[lower_triangle][A_nonzero]
+    edge_dists = distance_matrix[lt_rows, lt_cols][A_nz_mask].astype(float)
 
     # Random-tiebreak rank, mirroring R's rank(..., ties.method = "random"):
     # shuffle indices, stable-sort the shuffled distances, then invert.
