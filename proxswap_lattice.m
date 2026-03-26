@@ -14,16 +14,30 @@
 % ------------
 %   Brain Connectivity Toolbox (BCT)
 %     clustering_coef_bu  -- per-node clustering coefficients (Watts & Strogatz 1998)
+%     clustering_coef_wu  -- per-node clustering coefficients, weighted networks
 %     get_components      -- connected-component labelling (Goni 2009/2011)
-%   Both files must be on the MATLAB path before calling proxswap_lattice.
+%   All three files must be on the MATLAB path before calling proxswap_lattice.
 %
 % Functions
 % ---------
 %   proxswap_lattice(network, weighted, shuffles)  -- main entry point
 %   build_pairs(D, distance_seq)
 %   proximity_pass(nodes, ring, budget, pairs, distance_seq)
-%   swapping_pass(nodes, ring, budget, total_budget)
+%   swapping_pass(nodes, node_seq, ring, budget, total_budget, distance_seq)
+%   interleave(index, nodes, distance_seq)
 %   assign_weights(network, A, D)
+%
+% Usage
+% -----
+%   % Binary lattice (default)
+%   [ring, CC] = proxswap_lattice(network);
+%   fprintf('Average clustering coefficient: %.4f\n', CC);
+%   fprintf('Degree sequences match: %d\n', ...
+%       isequal(sum(network ~= 0, 1), sum(ring, 1)));
+%
+%   % Weighted lattice
+%   [ring_w, CC_w] = proxswap_lattice(network, true, 100);
+%   fprintf('Weighted average clustering coefficient: %.4f\n', CC_w);
 
 function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 % PROXSWAP_LATTICE  Construct a degree-preserving ring lattice via
@@ -43,24 +57,25 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 %   Arguments
 %   ---------
 %   network  : n x n numeric matrix (weighted or binary, symmetric).
-%              Absolute values are taken internally, so signed weights are
-%              handled automatically.  Non-zero off-diagonal entries are
-%              treated as edges; the binary adjacency is derived internally
-%              as (network ~= 0).  Isolated nodes (degree zero) are
-%              supported.
+%              Non-zero off-diagonal entries are treated as edges; the binary
+%              adjacency is derived internally as (network ~= 0).  When
+%              WEIGHTED is false, edge weights have no effect on the result.
+%              Isolated nodes (degree zero) are supported.
 %   weighted : logical scalar, whether to return a weighted lattice
 %              (default false).  When true, observed edge weights from NETWORK
-%              are sorted in descending order and mapped onto lattice edges
-%              ranked by ascending ring distance, so that shorter (more local)
-%              connections receive the largest weights, following Muldoon,
-%              Bridgeford, & Bassett (2016).  The clustering coefficient is
-%              then computed via clustering_coef_wu (BCT) rather than
-%              clustering_coef_bu.  When false, a binary logical adjacency
-%              matrix is returned.
+%              are sorted in descending absolute-value order and mapped onto
+%              lattice edges ranked by ascending ring distance, so that shorter
+%              (more local) connections receive the largest-magnitude weights,
+%              following Muldoon, Bridgeford, & Bassett (2016).  Original signed
+%              weights are preserved.  The clustering coefficient is then
+%              computed via clustering_coef_wu (BCT), mirroring igraph's
+%              transitivity() which uses edge weights automatically when present.
+%              When false (default), a binary logical adjacency matrix is returned.
 %   shuffles : positive integer, number of independent random permutation
 %              passes to attempt (default 100).  Only passes producing a
-%              connected graph with zero degree error are retained; the one
-%              with the highest clustering coefficient is returned.
+%              graph with zero degree error are retained (and, when all nodes
+%              have degree > 0, also a connected graph); the one with the
+%              highest clustering coefficient is returned.
 %
 %   Returns
 %   -------
@@ -69,38 +84,57 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 %          When WEIGHTED is false (default), entries are logical (0/1).
 %          When WEIGHTED is true, entries contain the reassigned edge
 %          weights from NETWORK.  When the empirical fallback is taken,
-%          ring equals the binarised input (WEIGHTED false) or the absolute-
-%          value input matrix (WEIGHTED true).
+%          ring equals the binarised input (WEIGHTED false) or the original
+%          NETWORK matrix (WEIGHTED true).
 %   CC   : scalar double, average clustering coefficient of ring.  Equals
-%          the empirical CC when the empirical-fallback path is taken.
+%          the empirical CC when either fallback path is taken.
+%
+%   Warnings
+%   --------
+%   Two distinct warning conditions may be raised:
+%
+%   proxswap_lattice:noConvergence -- if no shuffle pass produces a valid
+%     lattice at all (i.e. every pass has a residual degree deficit or is
+%     disconnected), a warning is issued advising the caller to increase
+%     SHUFFLES, and the empirical graph is returned.
+%
+%   proxswap_lattice:empiricalFallback -- if at least one valid lattice
+%     was found but its best clustering coefficient does not exceed the
+%     empirical value, a warning reporting both coefficients is issued and
+%     the original adjacency (or weighted matrix) is returned.
 %
 %   Algorithm overview
 %   ------------------
 %   1. Pair precomputation   -- unique upper-triangle pairs at each ring
-%      distance d = 1 ... floor(n/2) are cached once.
+%      distance d = 1 ... floor(n/2) are cached once in BUILD_PAIRS.
 %   2. Proximity construction -- the degree sequence is randomly permuted
 %      onto ring positions; edges are added in increasing distance order,
 %      sorted by descending min(budget_i, budget_j) within each band.
+%      Implemented in PROXIMITY_PASS.
 %   3. Swap repair           -- any residual deficit is resolved by direct
 %      connection or an edge swap, scanning interleaved clockwise /
-%      counter-clockwise positions.
-%   4. Weight assignment     -- when WEIGHTED is true, observed weights are
-%      sorted descending and mapped onto lattice edges ranked by ascending
-%      ring distance (d_ij = min(|i-j|, n-|i-j|)), so that shorter
-%      connections receive the largest weights.  Ties in ring distance are
-%      broken at random.  Implemented in ASSIGN_WEIGHTS.
-%   5. Pass selection        -- only connected, zero-deficit passes are
-%      kept; the highest-CC pass is returned.
-%   6. Empirical fallback    -- if no valid pass beats the empirical CC,
-%      the original adjacency (or weighted matrix) is returned with a
-%      warning.
+%      counter-clockwise positions produced by INTERLEAVE.
+%      Implemented in SWAPPING_PASS.
+%   4. Connectivity check    -- skipped entirely when any node has degree
+%      zero (isolated nodes cannot form a connected graph regardless);
+%      otherwise get_components (BCT) is called on the candidate lattice.
+%   5. Weight assignment     -- when WEIGHTED is true, observed weights are
+%      sorted descending by absolute value and mapped onto lattice edges
+%      ranked by ascending ring distance (d_ij = min(|i-j|, n-|i-j|)), so
+%      that shorter connections receive the largest weights.  Ties in ring
+%      distance are broken at random.  Implemented in ASSIGN_WEIGHTS.
+%   6. Pass selection        -- only zero-deficit (and, when applicable,
+%      connected) passes are kept; the highest-CC pass is returned.
+%   7. Empirical fallback    -- see Warnings above.
 %
 %   Dependencies
 %   ------------
-%   clustering_coef_bu  (BCT) -- per-node clustering coefficients for
-%                                binary networks; average taken over nodes.
-%   clustering_coef_wu  (BCT) -- per-node clustering coefficients for
-%                                weighted networks; used when WEIGHTED true.
+%   clustering_coef_bu  (BCT) -- per-node clustering coefficients for binary
+%                                networks; average taken over nodes.
+%   clustering_coef_wu  (BCT) -- per-node clustering coefficients for weighted
+%                                networks; used when WEIGHTED true, mirroring
+%                                igraph::transitivity() which uses edge weights
+%                                automatically when they are present.
 %   get_components      (BCT) -- connectivity confirmed when exactly one
 %                                component is returned.
 
@@ -112,11 +146,6 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
     end
 
     % ------------------------------------------------------------------
-    % Ensure absolute values (handles signed weight matrices)
-    % ------------------------------------------------------------------
-    network = abs(network);
-
-    % ------------------------------------------------------------------
     % Derive binary adjacency
     % ------------------------------------------------------------------
     A = (network ~= 0);                         % logical, n x n
@@ -124,12 +153,16 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
     nodes  = size(A, 2);
     degree = sum(A, 1);                         % 1 x n row vector
 
+    % Skip the connectivity check when any node has degree zero:
+    % isolated nodes cannot form a connected graph regardless.
+    check_connectedness = all(degree ~= 0);
+
     % ------------------------------------------------------------------
     % Ring distance matrix  d_ij = min(|i-j|, n-|i-j|)
     % ------------------------------------------------------------------
-    node_seq = 1:nodes;
-    D = abs(bsxfun(@minus, node_seq', node_seq));
-    D = min(D, nodes - D);
+    node_seq     = 1:nodes;
+    D            = abs(bsxfun(@minus, node_seq', node_seq));
+    D            = min(D, nodes - D);
     distance_seq = 1:max(D(:));
 
     % ------------------------------------------------------------------
@@ -139,7 +172,9 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
 
     % ------------------------------------------------------------------
     % Empirical clustering coefficient (fallback reference).
-    % Use clustering_coef_wu for weighted, clustering_coef_bu for binary.
+    % igraph::transitivity(type = "average") uses edge weights automatically
+    % when they are present, so mirror that here: clustering_coef_wu when
+    % weighted, clustering_coef_bu when binary.
     % ------------------------------------------------------------------
     if weighted
         empirical_CC = mean(clustering_coef_wu(network));
@@ -169,15 +204,21 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
                                 pairs, distance_seq);
 
         % Swap repair (resolve residual deficit)
-        result = swapping_pass(nodes, result.ring, result.budget, ...
-                               result.total_budget);
+        result = swapping_pass(nodes, node_seq, result.ring, ...
+                               result.budget, result.total_budget, ...
+                               distance_seq);
 
-        % Reject: residual deficit or disconnected graph.
-        % get_components returns one entry in comp_sizes per component;
-        % a connected graph has exactly one component.
-        [~, comp_sizes] = get_components(double(result.ring));
-        if result.remaining > 0 || numel(comp_sizes) ~= 1
+        % Reject passes with residual degree deficit
+        if result.remaining > 0
             continue
+        end
+
+        % Connectivity check -- skipped when isolated nodes are present
+        if check_connectedness
+            [~, comp_sizes] = get_components(double(result.ring));
+            if numel(comp_sizes) ~= 1
+                continue
+            end
         end
 
         % Assign weights to the valid binary topology when requested
@@ -187,7 +228,9 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
         end
 
         % Clustering coefficient for this valid pass.
-        % Use clustering_coef_wu for weighted, clustering_coef_bu for binary.
+        % igraph::transitivity(type = "average") uses edge weights automatically
+        % when they are present, so mirror that here: clustering_coef_wu when
+        % weighted, clustering_coef_bu when binary.
         if weighted
             pass_CC = mean(clustering_coef_wu(pass_ring));
         else
@@ -204,19 +247,34 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
     end % shuffle loop
 
     % ------------------------------------------------------------------
-    % Empirical fallback check
+    % Determine whether any valid solution was found
     % ------------------------------------------------------------------
-    empirical_flag = (empirical_CC > best_CC);
+    if isinf(best_CC)
 
-    if empirical_flag
-        warning('proxswap_lattice:empiricalFallback', ...
-            ['The lattice solution did not produce a better CC (%.3f) ' ...
-             'than the empirical (%.3f).\nFalling back to empirical ' ...
-             'solution...'], best_CC, empirical_CC);
+        % Convergence failure: no valid pass produced at all
+        warning('proxswap_lattice:noConvergence', ...
+            ['The lattice solution did not converge. ' ...
+             'The empirical graph was returned.\n\n' ...
+             'Try increasing ''shuffles'' to find a suitable solution.']);
+
+        empirical_flag = true;
+
+    else
+
+        % At least one valid pass exists -- check whether empirical beats it
+        empirical_flag = (empirical_CC > best_CC);
+
+        if empirical_flag
+            warning('proxswap_lattice:empiricalFallback', ...
+                ['The lattice solution did not produce a better CC (%.3f) ' ...
+                 'than the empirical (%.3f).\nFalling back to empirical ' ...
+                 'solution...'], best_CC, empirical_CC);
+        end
+
     end
 
     % ------------------------------------------------------------------
-    % Restore original node ordering  (invert the permutation)
+    % Return the selected result
     % ------------------------------------------------------------------
     if empirical_flag
         % Return weighted matrix or binary adjacency depending on mode
@@ -225,9 +283,9 @@ function [ring, CC] = proxswap_lattice(network, weighted, shuffles)
         else
             ring = A;
         end
-        CC   = empirical_CC;
+        CC = empirical_CC;
     else
-        % original_order is the inverse permutation of best_swap:
+        % Restore original node ordering (invert the permutation):
         %   best_swap(original_order) == 1:nodes
         original_order = zeros(1, nodes);
         original_order(best_swap) = 1:nodes;
@@ -343,8 +401,8 @@ function result = proximity_pass(nodes, ring, budget, pairs, distance_seq)
             continue
         end
 
-        row_e = row_idx(elig_mask);      % eligible rows
-        col_e = col_idx(elig_mask);      % eligible cols
+        row_e  = row_idx(elig_mask);     % eligible rows
+        col_e  = col_idx(elig_mask);     % eligible cols
         n_elig = numel(row_e);
 
         % Sort eligible pairs by descending min(budget[r], budget[c]).
@@ -384,37 +442,45 @@ end % proximity_pass
 % ==========================================================================
 %  swapping_pass
 % ==========================================================================
-function result = swapping_pass(nodes, ring, budget, total_budget)
+function result = swapping_pass(nodes, node_seq, ring, budget, total_budget, distance_seq)
 % SWAPPING_PASS  Resolve residual degree deficit via direct connection or edge swap.
 %
 %   Translated directly from swapping_pass_c in proxswap.c.
 %
 %   At each iteration the node with the largest remaining deficit (i) is
 %   targeted.  Ring positions are scanned in interleaved clockwise /
-%   counter-clockwise order (nearest first) to find a connection for i:
+%   counter-clockwise order (nearest first), as produced by INTERLEAVE,
+%   to find a connection for i:
 %
-%     Direct connection: if any scanned node j has remaining budget and is not
-%     yet connected to i, the edge (i, j) is added immediately and the
+%     Direct connection: if any scanned node j has remaining budget and is
+%     not yet connected to i, the edge (i, j) is added immediately and the
 %     iteration continues.
 %
 %     Edge swap: if no direct partner exists, the scan finds the nearest
-%     unconnected node j that has at least one existing neighbour k not already
-%     connected to i.  The edge (j, k) is removed and (i, j) is added.  Node k
-%     recovers its budget and will be re-targeted in a later iteration.  Because
-%     one deficit is transferred rather than eliminated, total_budget is
-%     unchanged by a swap.
+%     unconnected node j that has at least one existing neighbour k not
+%     already connected to i.  The edge (j, k) is removed and (i, j) is
+%     added.  Node k recovers its budget and will be re-targeted in a later
+%     iteration.  Because one deficit is transferred rather than eliminated,
+%     total_budget is unchanged by a swap.
 %
-%   Iteration stops when total_budget reaches zero, when no swap can be found,
-%   or after the hard cap of 2 * nodes^2 iterations.
+%   Iteration stops when total_budget reaches zero, when no swap can be
+%   found, or after the hard cap of 2 * nodes^2 iterations.
 %
 %   Arguments
 %   ---------
 %   nodes        : scalar integer, number of nodes in the ring.
+%   node_seq     : integer vector 1:nodes, passed in to avoid re-creation
+%                  on every call; used when indexing neighbours during the
+%                  swap-candidate search.
 %   ring         : nodes x nodes logical/numeric adjacency matrix (will be
 %                  copied), as returned by proximity_pass().
-%   budget       : column vector of remaining degree deficits, as returned by
+%   budget       : column vector of remaining degree deficits, as returned
+%                  by proximity_pass().
+%   total_budget : scalar integer sum of budget, as returned by
 %                  proximity_pass().
-%   total_budget : scalar integer sum of budget, as returned by proximity_pass().
+%   distance_seq : integer vector 1:floor(nodes/2), passed directly to
+%                  INTERLEAVE to generate the clockwise / counter-clockwise
+%                  scan order.
 %
 %   Returns
 %   -------
@@ -425,7 +491,6 @@ function result = swapping_pass(nodes, ring, budget, total_budget)
     ring   = double(ring ~= 0);
     budget = double(budget(:));          % column vector
 
-    n_dist   = floor(nodes / 2);
     max_iter = 2 * nodes * nodes;
 
     for iter = 1:max_iter                %#ok<FORFLG>
@@ -436,55 +501,24 @@ function result = swapping_pass(nodes, ring, budget, total_budget)
         [max_bud, i] = max(budget);
         if max_bud == 0, break; end
 
-        % -----------------------------------------------------------------
-        % Build interleaved clockwise / counter-clockwise position list
-        % Mirrors the C code:  cw = (i + d) % n,  ccw = (i - d + n*d) % n
-        % translated to 1-based indices.
-        % -----------------------------------------------------------------
-        visited = false(1, nodes);
-        visited(i) = true;
-        interleaved = zeros(1, 2 * n_dist);
-        n_pos = 0;
+        % Interleave clockwise and counter-clockwise ring positions by distance
+        dist = interleave(i, nodes, distance_seq);
 
-        for d = 1:n_dist
-            % Clockwise neighbour at ring distance d (1-indexed)
-            cw = mod(i - 1 + d, nodes) + 1;
-            if ~visited(cw)
-                visited(cw)       = true;
-                n_pos             = n_pos + 1;
-                interleaved(n_pos) = cw;
-            end
-
-            % Counter-clockwise neighbour at ring distance d (1-indexed)
-            % C: ((i - d) % n + n) % n   with 0-indexed i
-            % MATLAB mod() is non-negative, so the +n guard is implicit.
-            ccw = mod(i - 1 - d, nodes) + 1;
-            if ~visited(ccw)
-                visited(ccw)       = true;
-                n_pos              = n_pos + 1;
-                interleaved(n_pos) = ccw;
-            end
-        end
-
-        interleaved = interleaved(1:n_pos);
+        % Available connections (diagonal is 0; will never appear in dist)
+        available_ring = ~logical(ring);
 
         % -----------------------------------------------------------------
         % Attempt 1 -- direct connection to nearest node with budget & no edge
         % -----------------------------------------------------------------
-        direct = 0;
-        for pi = 1:n_pos
-            j = interleaved(pi);
-            if budget(j) > 0 && ring(i, j) == 0
-                direct = j;
-                break
-            end
-        end
+        direct_mask       = (budget(dist) > 0) & available_ring(i, dist)';
+        direct_candidates = dist(direct_mask);
 
-        if direct > 0
-            ring(i, direct) = 1;
-            ring(direct, i) = 1;
+        if ~isempty(direct_candidates)
+            target         = direct_candidates(1);
+            ring(i, target) = 1;
+            ring(target, i) = 1;
             budget(i)      = budget(i)      - 1;
-            budget(direct) = budget(direct) - 1;
+            budget(target) = budget(target) - 1;
             total_budget   = total_budget   - 2;
             continue
         end
@@ -494,18 +528,18 @@ function result = swapping_pass(nodes, ring, budget, total_budget)
         % Find a nearby unconnected node j; remove one of j's edges (j,k);
         % add edge (i,j).  Node k recovers its budget for later resolution.
         % -----------------------------------------------------------------
-        swapped = false;
+        swapped    = false;
+        candidates = dist(available_ring(i, dist)');
 
-        for pi = 1:n_pos
+        for pi = 1:numel(candidates)
             if swapped, break; end
-            j = interleaved(pi);
-            if ring(i, j) ~= 0, continue; end  % already connected
+            j = candidates(pi);
 
             % Find first neighbour k of j that is not i and not connected to i
-            for k = 1:nodes
-                if k == i,            continue; end
-                if ring(j, k) == 0,   continue; end  % not a neighbour of j
-                if ring(i, k) ~= 0,   continue; end  % already connected to i
+            for k = node_seq
+                if k == i,           continue; end
+                if ring(j, k) == 0,  continue; end  % not a neighbour of j
+                if ring(i, k) ~= 0,  continue; end  % already connected to i
 
                 % Perform swap: remove (j,k), add (i,j)
                 ring(j, k) = 0;
@@ -515,7 +549,7 @@ function result = swapping_pass(nodes, ring, budget, total_budget)
 
                 budget(i) = budget(i) - 1;  % i gains an edge
                 budget(k) = budget(k) + 1;  % k loses an edge (recovers budget)
-                % total_budget is unchanged: budget[i]-1 and budget[k]+1 cancel
+                % total_budget is unchanged: budget(i)-1 and budget(k)+1 cancel
 
                 swapped = true;
                 break
@@ -534,6 +568,67 @@ end % swapping_pass
 
 
 % ==========================================================================
+%  interleave
+% ==========================================================================
+function pos = interleave(index, nodes, distance_seq)
+% INTERLEAVE  Build an interleaved clockwise / counter-clockwise position list.
+%
+%   Generates the scan order used by swapping_pass() when searching for a
+%   direct connection or swap partner for node INDEX.  Starting from INDEX,
+%   positions at ring distance d = 1, 2, ... are emitted in alternating
+%   clockwise / counter-clockwise pairs, yielding a sequence that visits the
+%   nearest ring neighbours first.  Duplicate positions (which can occur when
+%   nodes is even at the maximum distance) are dropped via a visited mask.
+%
+%   Arguments
+%   ---------
+%   index        : scalar integer (1-based), the node whose neighbours are
+%                  to be enumerated.
+%   nodes        : scalar integer, total number of nodes in the ring.
+%   distance_seq : integer vector 1:floor(nodes/2), the distances at which
+%                  to emit clockwise / counter-clockwise positions.
+%
+%   Returns
+%   -------
+%   pos : integer row vector of 1-based node indices in interleaved
+%         nearest-first order, with duplicates removed.  Length is at most
+%         2 * floor(nodes / 2), and may be shorter when nodes is odd or
+%         duplicates are dropped at the maximum distance.
+
+    n_dist  = numel(distance_seq);
+    buf     = zeros(1, 2 * n_dist);
+    n_pos   = 0;
+    visited = false(1, nodes);
+    visited(index) = true;
+
+    for d = distance_seq
+
+        % Clockwise neighbour at ring distance d (1-indexed)
+        cw = mod(index - 1 + d, nodes) + 1;
+        if ~visited(cw)
+            visited(cw) = true;
+            n_pos       = n_pos + 1;
+            buf(n_pos)  = cw;
+        end
+
+        % Counter-clockwise neighbour at ring distance d (1-indexed).
+        % MATLAB's mod() is always non-negative, so no explicit +nodes guard
+        % is needed (mirrors the +n*d trick in the R formulation).
+        ccw = mod(index - 1 - d, nodes) + 1;
+        if ~visited(ccw)
+            visited(ccw) = true;
+            n_pos        = n_pos + 1;
+            buf(n_pos)   = ccw;
+        end
+
+    end
+
+    pos = buf(1:n_pos);
+
+end % interleave
+
+
+% ==========================================================================
 %  assign_weights
 % ==========================================================================
 function A = assign_weights(network, A, D)
@@ -542,17 +637,21 @@ function A = assign_weights(network, A, D)
 %   Translated from assign_weights() in proxswap_lattice.R.
 %
 %   Following Muldoon, Bridgeford, & Bassett (2016): observed edge weights are
-%   sorted in descending order and mapped onto lattice edges ranked by ascending
-%   ring distance (d_ij = min(|i-j|, n-|i-j|)), so that shorter (more local)
-%   connections receive the largest weights.  This uses the ring's structural
-%   distances directly rather than any network-derived proxy.  Ties in ring
-%   distance are broken at random.
+%   sorted in descending order by absolute value and mapped onto lattice edges
+%   ranked by ascending ring distance (d_ij = min(|i-j|, n-|i-j|)), so that
+%   shorter (more local) connections receive the largest-magnitude weights.
+%   This uses the ring's structural distances directly rather than any
+%   network-derived proxy.  Original signed weights are preserved.  Ties in
+%   ring distance are broken at random.
 %
 %   Arguments
 %   ---------
-%   network : n x n numeric matrix, the original weighted network (absolute
-%             values assumed already taken by the caller).  Non-zero lower-
-%             triangle entries supply the weight pool.
+%   network : n x n numeric matrix, the original weighted network as passed
+%             into proxswap_lattice() (with WEIGHTED true).  Non-zero lower-
+%             triangle entries supply the weight pool; weights are extracted
+%             with their original signs and sorted by descending absolute
+%             value so that larger-magnitude weights are placed on shorter
+%             lattice edges.
 %   A       : n x n logical or numeric binary adjacency matrix (the lattice
 %             topology, as returned by swapping_pass).
 %   D       : n x n integer matrix where entry (i, j) holds the circular ring
@@ -567,10 +666,18 @@ function A = assign_weights(network, A, D)
     % Lower-triangle mask (strict: excludes diagonal)
     lt_mask = logical(tril(ones(n), -1));
 
-    % Extract non-zero weights from lower triangle of network, sorted descending.
-    % Mirrors R: weights <- sort(network[lower_triangle][network_nonzero], decreasing = TRUE)
-    net_lt  = network(lt_mask);
-    weights = sort(net_lt(net_lt ~= 0), 'descend');  % column vector, descending
+    % Extract non-zero weights from lower triangle of network.
+    % Mirrors R: weights <- network[lower_triangle][network_nonzero][
+    %               order(abs(network)[lower_triangle][network_nonzero],
+    %                     decreasing = TRUE)]
+    % Original (possibly signed) values are extracted, then reordered by
+    % descending absolute value so that larger-magnitude weights are placed
+    % on shorter lattice edges.
+    net_lt        = network(lt_mask);
+    nonzero_mask  = net_lt ~= 0;
+    net_lt_nz     = net_lt(nonzero_mask);              % original signed values
+    [~, sort_idx] = sort(abs(net_lt_nz), 'descend');   % order by |weight|
+    weights       = net_lt_nz(sort_idx);                % column vector, descending |w|
 
     % Identify non-zero edges in lower triangle of A
     A_lt      = double(A(lt_mask));
@@ -590,10 +697,10 @@ function A = assign_weights(network, A, D)
     weight_order(rp(sort_idx)) = 1:n_edges;
 
     % Write weights into lower triangle, zero upper triangle, symmetrise
-    result          = zeros(n);
-    lt_vals         = zeros(size(A_lt));
+    result             = zeros(n);
+    lt_vals            = zeros(size(A_lt));
     lt_vals(A_nz_mask) = weights(weight_order);
-    result(lt_mask) = lt_vals;
-    A               = result + result';     % symmetric weighted matrix
+    result(lt_mask)    = lt_vals;
+    A                  = result + result';   % symmetric weighted matrix
 
 end % assign_weights

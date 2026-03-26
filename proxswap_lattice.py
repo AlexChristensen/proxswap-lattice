@@ -27,7 +27,8 @@ Functions
 proxswap_lattice(network, weighted, shuffles)  -- main entry point
 _build_pairs(D, distance_seq)
 _proximity_pass(nodes, ring, budget, pairs, distance_seq)
-_swapping_pass(nodes, ring, budget, total_budget)
+_swapping_pass(nodes, node_seq, ring, budget, total_budget, distance_seq)
+_interleave(index, nodes, distance_seq)
 _assign_weights(network, A, distance_matrix, rng)
 
 Usage
@@ -73,25 +74,26 @@ def proxswap_lattice(
     ----------
     network : ndarray, shape (n, n)
         Square, symmetric numeric matrix representing a network (e.g. partial
-        correlations).  Absolute values are taken internally, so signed weights
-        are handled automatically.  Non-zero off-diagonal entries are treated as
-        edges; the binary adjacency is derived internally as ``network != 0``.
-        Isolated nodes (degree zero) are supported.
+        correlations).  Non-zero off-diagonal entries are treated as edges;
+        the binary adjacency is derived internally as ``network != 0``.
+        When ``weighted`` is ``False``, edge weights have no effect on the
+        result.  Isolated nodes (degree zero) are supported.
     weighted : bool, optional
         Whether to return a weighted ring lattice.  When ``True``, edge weights
         from ``network`` are reassigned to the lattice topology following
         Muldoon, Bridgeford, & Bassett (2016): observed weights are sorted in
-        descending order and mapped onto lattice edges ranked by ascending ring
-        distance, so that shorter (more local) connections receive the largest
-        weights.  The clustering coefficient is computed via
+        descending order by absolute value and mapped onto lattice edges ranked
+        by ascending ring distance, so that shorter (more local) connections
+        receive the largest-magnitude weights.  Original signed weights are
+        preserved.  The clustering coefficient is computed via
         ``nx.average_clustering(..., weight='weight')``.  When ``False``
         (default), a binary ``bool`` adjacency matrix is returned and the
         unweighted clustering coefficient is used throughout.
     shuffles : int, optional
         Number of independent random permutation passes to attempt.  Only
-        passes producing a connected graph with zero degree error are retained;
-        the one with the highest clustering coefficient is returned.
-        Default: ``100``.
+        passes producing a graph with zero degree error are retained (and,
+        when all nodes have degree > 0, also a connected graph); the one with
+        the highest clustering coefficient is returned.  Default: ``100``.
 
     Returns
     -------
@@ -100,34 +102,53 @@ def proxswap_lattice(
         clustering coefficient found.  When ``weighted=False`` (default),
         dtype is ``bool``.  When ``weighted=True``, dtype is ``float64`` and
         entries contain the reassigned edge weights from ``network``.  When
-        the empirical fallback is taken, ``ring`` equals the binarised input
-        (``weighted=False``) or the absolute-value input matrix
+        either fallback path is taken, ``ring`` equals the binarised input
+        (``weighted=False``) or the original ``network`` matrix
         (``weighted=True``).
     cc : float
         Average clustering coefficient of ``ring``.  Equals the empirical CC
-        when the empirical-fallback path is taken.
+        when either fallback path is taken.
+
+    Warns
+    -----
+    UserWarning
+        Two distinct warning conditions may be raised:
+
+        *Convergence failure* -- if no shuffle pass produces a valid lattice
+        at all (i.e. every pass has a residual degree deficit or is
+        disconnected), a warning is issued advising the caller to increase
+        ``shuffles``, and the empirical graph is returned.
+
+        *Empirical fallback* -- if at least one valid lattice was found but
+        its best clustering coefficient does not exceed the empirical value,
+        a warning reporting both coefficients is issued and the original
+        adjacency (or weighted matrix) is returned.
 
     Notes
     -----
     Algorithm
     ~~~~~~~~~
     1. **Pair precomputation** – unique upper-triangle pairs at each ring
-       distance ``d = 1 … floor(n/2)`` are cached once.
+       distance ``d = 1 … floor(n/2)`` are cached once in ``_build_pairs``.
     2. **Proximity construction** – the degree sequence is randomly permuted
        onto ring positions; edges are added in increasing distance order,
        sorted by descending ``min(budget_i, budget_j)`` within each band.
+       Implemented in ``_proximity_pass``.
     3. **Swap repair** – any residual deficit is resolved by direct connection
        or an edge swap, scanning interleaved clockwise / counter-clockwise
-       ring positions.
-    4. **Weight assignment** – when ``weighted=True``, observed weights are
-       sorted descending and mapped onto lattice edges ranked by ascending ring
-       distance (``d_ij = min(|i-j|, n-|i-j|)``), so that shorter connections
-       receive the largest weights.  Ties in ring distance are broken at random.
-       Implemented in ``_assign_weights``.
-    5. **Pass selection** – only connected, zero-deficit passes are kept; the
-       highest-CC pass is returned.
-    6. **Empirical fallback** – if no valid pass beats the empirical CC, the
-       original adjacency (or weighted matrix) is returned with a warning.
+       ring positions produced by ``_interleave``.
+       Implemented in ``_swapping_pass``.
+    4. **Connectivity check** – skipped entirely when any node has degree zero
+       (isolated nodes cannot form a connected graph regardless); otherwise
+       ``nx.is_connected`` is called on the candidate lattice.
+    5. **Weight assignment** – when ``weighted=True``, observed weights are
+       sorted descending by absolute value and mapped onto lattice edges ranked
+       by ascending ring distance (``d_ij = min(|i-j|, n-|i-j|)``), so that
+       shorter connections receive the largest weights.  Ties in ring distance
+       are broken at random.  Implemented in ``_assign_weights``.
+    6. **Pass selection** – only zero-deficit (and, when applicable, connected)
+       passes are kept; the highest-CC pass is returned.
+    7. **Empirical fallback** – see Warns above.
 
     Dependencies
     ~~~~~~~~~~~~
@@ -138,10 +159,6 @@ def proxswap_lattice(
     ``nx.is_connected`` – confirms that the graph has exactly one connected
     component; mirrors ``igraph::is_connected``.
     """
-    # ------------------------------------------------------------------
-    # Ensure absolute values (handles signed weight matrices)
-    # ------------------------------------------------------------------
-    network = np.abs(network)
 
     # ------------------------------------------------------------------
     # Derive binary adjacency
@@ -151,12 +168,16 @@ def proxswap_lattice(
     nodes  = A.shape[1]
     degree = A.sum(axis=0).astype(int)              # 1-D, length n
 
+    # Skip the connectivity check when any node has degree zero:
+    # isolated nodes cannot form a connected graph regardless.
+    check_connectedness = bool(np.all(degree != 0))
+
     # ------------------------------------------------------------------
     # Ring distance matrix  d_ij = min(|i-j|, n-|i-j|)
     # ------------------------------------------------------------------
-    idx = np.arange(nodes)
-    D   = np.abs(idx[:, None] - idx[None, :])
-    D   = np.minimum(D, nodes - D)
+    idx          = np.arange(nodes)
+    D            = np.abs(idx[:, None] - idx[None, :])
+    D            = np.minimum(D, nodes - D)
     distance_seq = np.arange(1, D.max() + 1)
 
     # ------------------------------------------------------------------
@@ -184,6 +205,7 @@ def proxswap_lattice(
     best_swap:  np.ndarray | None = None
     best_CC:    float             = -np.inf
 
+    node_seq  = np.arange(nodes)
     ring_init = np.zeros((nodes, nodes), dtype=np.int32)
 
     # ------------------------------------------------------------------
@@ -202,14 +224,20 @@ def proxswap_lattice(
                               pairs, distance_seq)
 
         # Swap repair (resolve residual deficit)
-        res = _swapping_pass(nodes, res["ring"], res["budget"],
-                             res["total_budget"])
+        res = _swapping_pass(nodes, node_seq, res["ring"], res["budget"],
+                             res["total_budget"], distance_seq)
 
-        # Reject: residual deficit or disconnected graph.
-        # nx.is_connected mirrors igraph::is_connected.
-        G_pass = nx.from_numpy_array(res["ring"].astype(float))
-        if res["remaining"] > 0 or not nx.is_connected(G_pass):
+        # Reject passes with residual degree deficit
+        if res["remaining"] > 0:
             continue
+
+        # Connectivity check -- skipped when isolated nodes are present
+        if check_connectedness:
+            G_pass = nx.from_numpy_array(res["ring"].astype(float))
+            if not nx.is_connected(G_pass):
+                continue
+        else:
+            G_pass = nx.from_numpy_array(res["ring"].astype(float))
 
         # Assign weights to the valid binary topology when requested.
         # pass_ring is float64 with reassigned weights; otherwise bool.
@@ -228,20 +256,35 @@ def proxswap_lattice(
             best_swap = swap_order.copy()
 
     # ------------------------------------------------------------------
-    # Empirical fallback check
+    # Determine whether any valid solution was found
     # ------------------------------------------------------------------
-    empirical_flag = empirical_CC > best_CC
+    if np.isinf(best_CC):
 
-    if empirical_flag:
+        # Convergence failure: no valid pass produced at all
         warnings.warn(
-            f"The lattice solution did not produce a better CC ({best_CC:.3f}) "
-            f"than the empirical ({empirical_CC:.3f}).\n"
-            "Falling back to empirical solution...",
+            "The lattice solution did not converge. "
+            "The empirical graph was returned.\n\n"
+            "Try increasing `shuffles` to find a suitable solution.",
             stacklevel=2,
         )
 
+        empirical_flag = True
+
+    else:
+
+        # At least one valid pass exists -- check whether empirical beats it
+        empirical_flag = empirical_CC > best_CC
+
+        if empirical_flag:
+            warnings.warn(
+                f"The lattice solution did not produce a better CC ({best_CC:.3f}) "
+                f"than the empirical ({empirical_CC:.3f}).\n"
+                "Falling back to empirical solution...",
+                stacklevel=2,
+            )
+
     # ------------------------------------------------------------------
-    # Restore original node ordering  (invert the permutation)
+    # Return the selected result
     # ------------------------------------------------------------------
     if empirical_flag:
         # Return weighted matrix or binary adjacency depending on mode
@@ -314,6 +357,16 @@ def _proximity_pass(
 
     Translated directly from ``proximity_pass_c`` in ``proxswap.c``.
 
+    Starting from the supplied (initially empty) ring adjacency, edges are
+    added one distance band at a time.  Within each band, eligible pairs --
+    those where both endpoints still have remaining degree budget and are not
+    yet connected -- are sorted by descending min(budget_i, budget_j) so that
+    the most degree-deficient pairs receive the shortest available connections
+    first.  Each pair is then considered in that order, with budgets re-checked
+    immediately before assignment because earlier placements in the same band
+    can exhaust a node's budget.  The loop exits early once all degree budgets
+    reach zero.
+
     Parameters
     ----------
     nodes        : number of nodes.
@@ -380,20 +433,49 @@ def _proximity_pass(
 
 def _swapping_pass(
     nodes:        int,
+    node_seq:     np.ndarray,
     ring:         np.ndarray,
     budget:       np.ndarray,
     total_budget: int,
+    distance_seq: np.ndarray,
 ) -> dict:
     """Resolve residual degree deficit via direct connection or edge swap.
 
     Translated directly from ``swapping_pass_c`` in ``proxswap.c``.
 
+    At each iteration the node with the largest remaining deficit (i) is
+    targeted.  Ring positions are scanned in interleaved clockwise /
+    counter-clockwise order (nearest first), as produced by ``_interleave``,
+    to find a connection for i:
+
+    *Direct connection*: if any scanned node j has remaining budget and is not
+    yet connected to i, the edge (i, j) is added immediately and the iteration
+    continues.
+
+    *Edge swap*: if no direct partner exists, the scan finds the nearest
+    unconnected node j that has at least one existing neighbour k not already
+    connected to i.  The edge (j, k) is removed and (i, j) is added.  Node k
+    recovers its budget and will be re-targeted in a later iteration.  Because
+    one deficit is transferred rather than eliminated, total_budget is unchanged
+    by a swap.
+
+    Iteration stops when total_budget reaches zero, when no swap can be found,
+    or after the hard cap of 2 * nodes ** 2 iterations.
+
     Parameters
     ----------
     nodes        : number of nodes.
-    ring         : ``(nodes, nodes)`` int array (copy before call if needed).
-    budget       : 1-D int array of degree deficits.
-    total_budget : sum of ``budget``.
+    node_seq     : 1-D int array ``np.arange(nodes)``, passed in to avoid
+                   re-creation on every call; used to index neighbours during
+                   the swap-candidate search.
+    ring         : ``(nodes, nodes)`` int array (copy before call if needed),
+                   as returned by ``_proximity_pass``.
+    budget       : 1-D int array of degree deficits, as returned by
+                   ``_proximity_pass``.
+    total_budget : sum of ``budget``, as returned by ``_proximity_pass``.
+    distance_seq : int array ``1 … floor(nodes/2)``, passed directly to
+                   ``_interleave`` to generate the clockwise / counter-clockwise
+                   scan order.
 
     Returns
     -------
@@ -402,7 +484,6 @@ def _swapping_pass(
     ring   = ring.astype(np.int32)
     budget = budget.astype(np.int32)
 
-    n_dist   = nodes // 2
     max_iter = 2 * nodes * nodes
 
     for _ in range(max_iter):
@@ -410,67 +491,53 @@ def _swapping_pass(
         if total_budget == 0:
             break
 
-        # Node with largest remaining deficit
+        # Node with largest remaining deficit (0-based)
         i = int(np.argmax(budget))
         if budget[i] == 0:
             break
 
-        # -----------------------------------------------------------------
-        # Build interleaved clockwise / counter-clockwise position list
-        # Mirrors C:  cw = (i + d) % n,  ccw = ((i - d) % n + n) % n
-        # Both use 0-based indices throughout this function.
-        # -----------------------------------------------------------------
-        visited     = np.zeros(nodes, dtype=bool)
-        visited[i]  = True
-        interleaved = []
+        # Interleave clockwise and counter-clockwise ring positions by distance
+        interleaved = _interleave(i, nodes, distance_seq)
 
-        for d in range(1, n_dist + 1):
-            cw = (i + d) % nodes
-            if not visited[cw]:
-                visited[cw] = True
-                interleaved.append(cw)
-
-            ccw = (i - d) % nodes        # Python % is always non-negative
-            if not visited[ccw]:
-                visited[ccw] = True
-                interleaved.append(ccw)
+        # Available connections (diagonal is False; will never appear in interleaved)
+        available_ring = ~ring.astype(bool)
 
         # -----------------------------------------------------------------
-        # Attempt 1 – direct connection
+        # Attempt 1 -- direct connection to nearest node with budget & no edge
         # -----------------------------------------------------------------
-        direct = -1
-        for j in interleaved:
-            if budget[j] > 0 and ring[i, j] == 0:
-                direct = j
-                break
+        direct_candidates = [j for j in interleaved
+                             if budget[j] > 0 and available_ring[i, j]]
 
-        if direct >= 0:
-            ring[i, direct] = 1
-            ring[direct, i] = 1
+        if direct_candidates:
+            target          = direct_candidates[0]
+            ring[i, target] = 1
+            ring[target, i] = 1
             budget[i]      -= 1
-            budget[direct] -= 1
+            budget[target] -= 1
             total_budget   -= 2
             continue
 
         # -----------------------------------------------------------------
-        # Attempt 2 – edge swap
-        # Find nearby unconnected node j; remove one of j's edges (j,k);
-        # add edge (i,j).  Node k recovers its budget for later resolution.
+        # Attempt 2 -- edge swap
+        # Find a nearby unconnected node j; remove one of j's edges (j, k);
+        # add edge (i, j).  Node k recovers its budget for later resolution.
         # -----------------------------------------------------------------
-        swapped = False
+        swapped    = False
+        candidates = [j for j in interleaved if available_ring[i, j]]
 
-        for j in interleaved:
+        for j in candidates:
             if swapped:
                 break
-            if ring[i, j] != 0:          # already connected
-                continue
 
-            for k in range(nodes):
-                if k == i:               continue
-                if ring[j, k] == 0:      continue   # not a neighbour of j
-                if ring[i, k] != 0:      continue   # already connected to i
+            # Find first neighbour k of j that is not i and not connected to i
+            neighborhood = np.where(
+                ring[j].astype(bool) & (node_seq != i) & available_ring[i]
+            )[0]
 
-                # Perform swap: remove (j,k), add (i,j)
+            if neighborhood.size > 0:
+                k = int(neighborhood[0])
+
+                # Perform swap: remove (j, k), add (i, j)
                 ring[j, k] = 0
                 ring[k, j] = 0
                 ring[i, j] = 1
@@ -478,16 +545,68 @@ def _swapping_pass(
 
                 budget[i] -= 1   # i gains an edge
                 budget[k] += 1   # k loses an edge (recovers budget)
-                # total_budget unchanged: -1 and +1 cancel
+                # total_budget is unchanged: -1 and +1 cancel
 
                 swapped = True
-                break
 
         if not swapped:
             break
 
     return {"ring": ring.astype(bool), "remaining": int(total_budget)}
 
+
+# =============================================================================
+# _interleave
+# =============================================================================
+
+def _interleave(
+    index:        int,
+    nodes:        int,
+    distance_seq: np.ndarray,
+) -> list[int]:
+    """Build an interleaved clockwise / counter-clockwise position list.
+
+    Generates the scan order used by ``_swapping_pass`` when searching for a
+    direct connection or swap partner for node ``index``.  Starting from
+    ``index``, positions at ring distance d = 1, 2, ... are emitted in
+    alternating clockwise / counter-clockwise pairs, yielding a sequence that
+    visits the nearest ring neighbours first.  Duplicate positions (which can
+    occur when nodes is even at the maximum distance) are dropped via a visited
+    mask.
+
+    Parameters
+    ----------
+    index        : scalar int (0-based), the node whose neighbours are to be
+                   enumerated.
+    nodes        : total number of nodes in the ring.
+    distance_seq : int array ``1 … floor(nodes/2)``, the distances at which to
+                   emit clockwise / counter-clockwise positions.
+
+    Returns
+    -------
+    list of int
+        0-based node indices in interleaved nearest-first order, with
+        duplicates removed.  Length is at most ``2 * floor(nodes / 2)``, and
+        may be shorter when nodes is odd or duplicates are dropped at the
+        maximum distance.
+    """
+    visited        = np.zeros(nodes, dtype=bool)
+    visited[index] = True
+    result: list[int] = []
+
+    for d in distance_seq:
+        cw = (index + d) % nodes
+        if not visited[cw]:
+            visited[cw] = True
+            result.append(int(cw))
+
+        # Python's % is always non-negative, so no explicit +nodes guard needed
+        ccw = (index - d) % nodes
+        if not visited[ccw]:
+            visited[ccw] = True
+            result.append(int(ccw))
+
+    return result
 
 
 # =============================================================================
@@ -505,17 +624,21 @@ def _assign_weights(
     Translated from ``assign_weights()`` in ``proxswap_lattice.R``.
 
     Following Muldoon, Bridgeford, & Bassett (2016): observed edge weights are
-    sorted in descending order and mapped onto lattice edges ranked by ascending
-    ring distance (``d_ij = min(|i-j|, n-|i-j|)``), so that shorter (more
-    local) connections receive the largest weights.  This uses the ring's
-    structural distances directly rather than any network-derived proxy.
-    Ties in ring distance are broken at random.
+    sorted in descending order by absolute value and mapped onto lattice edges
+    ranked by ascending ring distance (``d_ij = min(|i-j|, n-|i-j|)``), so
+    that shorter (more local) connections receive the largest-magnitude weights.
+    This uses the ring's structural distances directly rather than any
+    network-derived proxy.  Original signed weights are preserved.  Ties in
+    ring distance are broken at random.
 
     Parameters
     ----------
     network : ndarray, shape (n, n)
-        The original weighted network (absolute values assumed already taken
-        by the caller).  Non-zero lower-triangle entries supply the weight pool.
+        The original weighted network as passed into ``proxswap_lattice``
+        (with ``weighted=True``).  Non-zero lower-triangle entries supply the
+        weight pool; weights are extracted with their original signs and sorted
+        by descending absolute value so that larger-magnitude weights are placed
+        on shorter lattice edges.
     A : ndarray, shape (n, n)
         Binary adjacency matrix (the lattice topology as returned by
         ``_swapping_pass``).  May be ``bool`` or integer.
@@ -538,10 +661,17 @@ def _assign_weights(
     # Lower-triangle mask (strict: excludes diagonal), matching R's lower.tri()
     lt_rows, lt_cols = np.tril_indices(n, k=-1)
 
-    # Extract non-zero weights from lower triangle of network, sorted descending.
-    # Mirrors R: weights <- sort(network[lower_triangle][network_nonzero], decreasing = TRUE)
-    net_lt  = network[lt_rows, lt_cols]
-    weights = np.sort(net_lt[net_lt != 0])[::-1]        # descending
+    # Extract non-zero weights from lower triangle of network.
+    # Mirrors R: weights <- network[lower_triangle][network_nonzero][
+    #               order(abs(network)[lower_triangle][network_nonzero],
+    #                     decreasing = TRUE)]
+    # Original (possibly signed) values are extracted, then reordered by
+    # descending absolute value so that larger-magnitude weights are placed
+    # on shorter lattice edges.
+    net_lt    = network[lt_rows, lt_cols]
+    net_lt_nz = net_lt[net_lt != 0]                              # original signed values
+    sort_idx  = np.argsort(-np.abs(net_lt_nz), kind="stable")   # order by |weight|
+    weights   = net_lt_nz[sort_idx]                              # 1-D, descending |w|
 
     # Identify non-zero edges in lower triangle of A
     A_lt      = A[lt_rows, lt_cols].astype(float)
@@ -556,14 +686,14 @@ def _assign_weights(
     n_edges  = edge_dists.size
     rp       = rng.permutation(n_edges)
     sort_idx = np.argsort(edge_dists[rp], kind="stable")
-    weight_order          = np.empty(n_edges, dtype=int)
-    weight_order[rp[sort_idx]] = np.arange(n_edges)    # 0-based ranks
+    weight_order                = np.empty(n_edges, dtype=int)
+    weight_order[rp[sort_idx]]  = np.arange(n_edges)            # 0-based ranks
 
     # Write weights into lower triangle, zero upper triangle, symmetrise
-    lt_vals             = np.zeros(lt_rows.size)
-    lt_vals[A_nz_mask]  = weights[weight_order]
-    result              = np.zeros((n, n), dtype=float)
+    lt_vals            = np.zeros(lt_rows.size)
+    lt_vals[A_nz_mask] = weights[weight_order]
+    result             = np.zeros((n, n), dtype=float)
     result[lt_rows, lt_cols] = lt_vals
-    result              = result + result.T              # symmetric
+    result             = result + result.T                       # symmetric
 
     return result
