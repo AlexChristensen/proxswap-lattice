@@ -39,7 +39,7 @@ Iteration stops when all deficits are resolved, when no swap can be found, or af
 
 ### 4. Pass selection
 
-A pass is valid only if the resulting graph is **connected** and has **zero residual degree error**. Among all valid passes, the one with the highest average clustering coefficient is returned.
+A pass is valid only if it has **zero residual degree error** and, when all nodes have degree > 0, the resulting graph is **connected** (the connectivity check is skipped entirely when any node has degree zero, since isolated nodes cannot form a connected graph regardless). Among all valid passes, the one with the highest average clustering coefficient is returned.
 
 ### 5. Empirical fallback
 
@@ -49,7 +49,7 @@ If no valid pass is found, or if the best lattice clustering coefficient is lowe
 
 ## Available implementations
 
-The algorithm is implemented in four languages. All ports are faithful translations of the same logic and produce identical results up to random-permutation differences across passes.
+The algorithm is implemented in three languages. All ports are faithful translations of the same logic and produce identical results up to random-permutation differences across passes.
 
 | File | Language | Dependencies | Notes |
 |------|----------|--------------|-------|
@@ -129,9 +129,10 @@ attr(L_weighted, "CC")
 
 ```matlab
 % All functions are contained in proxswap_lattice.m
-% Binary lattice (default)
-[L, CC] = proxswap_lattice(network, false, 100);
+% Binary lattice (weighted=false, shuffles=100 by default)
+[L, CC] = proxswap_lattice(network);
 fprintf('Average CC: %.4f\n', CC);
+fprintf('Degree sequences match: %d\n', isequal(sum(network ~= 0, 1), sum(L, 1)));
 
 % Weighted lattice
 [L_w, CC_w] = proxswap_lattice(network, true, 100);
