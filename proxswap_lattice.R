@@ -408,7 +408,8 @@ swapping_pass <- function(nodes, node_sequence, ring, budget, total_budget, dist
         # Update budgets
         budget[i] <- budget[i] - 1
         budget[k] <- budget[k] + 1
-        total_budget <- sum(total_budget)
+
+        # Total budget is unchanged with swap
         swapped <- TRUE
 
         # Break out of loop
